@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Legacy Pulse</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50: '#f0f9ff', 100: '#e0f2fe', 500: '#0ea5e9', 600: '#0284c7', 700: '#0369a1', 900: '#0c4a6e' }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .fade-in { animation: fadeIn 0.3s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+  <div id="app" class="min-h-screen flex flex-col">
+    <!-- Header -->
+    <header class="bg-white border-b border-slate-200 sticky top-0 z-40">
+      <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 rounded-lg bg-brand-600 flex items-center justify-center text-white font-bold text-sm">LP</div>
+          <span class="font-semibold text-lg tracking-tight">Legacy Pulse</span>
+        </div>
+        <nav id="nav" class="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600">
+          <!-- filled by JS -->
+        </nav>
+        <div id="auth-area" class="flex items-center gap-3">
+          <!-- filled by JS -->
+        </div>
+      </div>
+    </header>
+
+    <main id="main" class="flex-1 max-w-6xl w-full mx-auto px-4 py-8">
+      <!-- content injected -->
+    </main>
+
+    <footer class="border-t border-slate-200 py-6 text-center text-sm text-slate-500">
+      Legacy Pulse MVP · Secure Digital Legacy Platform · Engineering Evaluation
+    </footer>
+  </div>
+
+  <script>
+    const API = 'http://localhost:3001/api';
+    let token = localStorage.getItem('lp_access') || null;
+    let refresh = localStorage.getItem('lp_refresh') || null;
+    let user = null;
+
+    async function api(path, options = {}) {
+      const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const res = await fetch(`${API}${path}`, { ...options, headers });
+      if (res.status === 401 && refresh) {
+        // try refresh
+        const r = await fetch(`${API}/auth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: refresh })
+        });
+        if (r.ok) {
+          const data = await r.json();
+          token = data.access_token;
+          refresh = data.refresh_token;
+          localStorage.setItem('lp_access', token);
+          localStorage.setItem('lp_refresh', refresh);
+          headers['Authorization'] = `Bearer ${token}`;
+          return fetch(`${API}${path}`, { ...options, headers });
+        }
+      }
+      return res;
+    }
+
+    function show(html) {
+      document.getElementById('main').innerHTML = `<div class="fade-in">${html}</div>`;
+    }
+
+    function toast(msg, type = 'info') {
+      const el = document.createElement('div');
+      el.className = `fixed bottom-4 right-4 px-4 py-2 rounded-lg shadow-lg text-white text-sm z-50 ${type === 'error' ? 'bg-red-600' : 'bg-brand-600'}`;
+      el.textContent = msg;
+      document.body.appendChild(el);
+      setTimeout(() => el.remove(), 3000);
+    }
+
+    // ---------- Views ----------
+    function renderLogin() {
+      show(`
+        <div class="max-w-md mx-auto mt-12 bg-white rounded-2xl shadow-sm border border-slate-200 p-8">
+          <h1 class="text-2xl font-bold mb-1">Welcome back</h1>
+          <p class="text-slate-500 mb-6 text-sm">Sign in to your Legacy Pulse account</p>
+          <form id="login-form" class="space-y-4">
+            <div>
+              <label class="block text-sm font-medium mb-1">Email</label>
+              <input name="email" type="email" required class="w-full border border-slate-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-brand-500 outline-none" value="alex@legacypulse.demo" />
+            </div>
+            <div>
+              <label class="block text-sm font-medium mb-1">Password</label>
+              <input name="password" type="password" required class="w-full border border-slate-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-brand-500 outline-none" value="Legacy123!" />
+            </div>
+            <button type="submit" class="w-full bg-brand-600 hover:bg-brand-700 text-white font-medium py-2.5 rounded-lg transition">Sign in</button>
+          </form>
+          <p class="mt-4 text-center text-sm text-slate-500">No account? <a href="#" id="to-register" class="text-brand-600 font-medium">Register</a></p>
+          <div class="mt-6 p-3 bg-slate-50 rounded-lg text-xs text-slate-600">
+            <strong>Demo accounts</strong><br>
+            Owner: alex@legacypulse.demo / Legacy123!<br>
+            Admin: admin@legacypulse.demo / Admin123!
+          </div>
+        </div>
+      `);
+      document.getElementById('login-form').onsubmit = async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        const res = await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: fd.get('email'), password: fd.get('password') }) });
+        if (!res.ok) { toast((await res.json()).detail || 'Login failed', 'error'); return; }
+        const data = await res.json();
+        token = data.access_token; refresh = data.refresh_token;
+        localStorage.setItem('lp_access', token); localStorage.setItem('lp_refresh', refresh);
+        await loadUser(); renderApp();
+      };
+      document.getElementById('to-register').onclick = (e) => { e.preventDefault(); renderRegister(); };
+    }
+
+    function renderRegister() {
+      show(`
+        <div class="max-w-md mx-auto mt-12 bg-white rounded-2xl shadow-sm border border-slate-200 p-8">
+          <h1 class="text-2xl font-bold mb-1">Create account</h1>
+          <p class="text-slate-500 mb-6 text-sm">Start preserving your legacy</p>
+          <form id="reg-form" class="space-y-4">
+            <div class="grid grid-cols-2 gap-3">
+              <div><label class="block text-sm font-medium mb-1">First name</label><input name="first_name" required class="w-full border rounded-lg px-3 py-2" /></div>
+              <div><label class="block text-sm font-medium mb-1">Last name</label><input name="last_name" required class="w-full border rounded-lg px-3 py-2" /></div>
+            </div>
+            <div><label class="block text-sm font-medium mb-1">Email</label><input name="email" type="email" required class="w-full border rounded-lg px-3 py-2" /></div>
+            <div><label class="block text-sm font-medium mb-1">Password</label><input name="password" type="password" required minlength="8" class="w-full border rounded-lg px-3 py-2" /><p class="text-xs text-slate-400 mt-1">Min 8 chars, 1 uppercase, 1 digit</p></div>
+            <button type="submit" class="w-full bg-brand-600 hover:bg-brand-700 text-white font-medium py-2.5 rounded-lg">Create account</button>
+          </form>
+          <p class="mt-4 text-center text-sm"><a href="#" id="to-login" class="text-brand-600">Back to sign in</a></p>
+        </div>
+      `);
+      document.getElementById('reg-form').onsubmit = async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        const res = await api('/auth/register', { method: 'POST', body: JSON.stringify(Object.fromEntries(fd)) });
+        if (!res.ok) { const err = await res.json(); toast(err.detail || JSON.stringify(err), 'error'); return; }
+        const data = await res.json();
+        token = data.access_token; refresh = data.refresh_token;
+        localStorage.setItem('lp_access', token); localStorage.setItem('lp_refresh', refresh);
+        await loadUser(); renderApp();
+      };
+      document.getElementById('to-login').onclick = (e) => { e.preventDefault(); renderLogin(); };
+    }
+
+    async function loadUser() {
+      const res = await api('/users/me');
+      if (res.ok) user = await res.json();
+      else user = null;
+    }
+
+    function renderApp() {
+      if (!user) { renderLogin(); return; }
+      document.getElementById('nav').innerHTML = `
+        <a href="#" data-page="dashboard" class="hover:text-brand-600">Dashboard</a>
+        <a href="#" data-page="memories" class="hover:text-brand-600">Memories</a>
+        <a href="#" data-page="timeline" class="hover:text-brand-600">Timeline</a>
+        <a href="#" data-page="family" class="hover:text-brand-600">Family</a>
+        <a href="#" data-page="legacy" class="hover:text-brand-600">Legacy Messages</a>
+        <a href="#" data-page="media" class="hover:text-brand-600">Media</a>
+        <a href="#" data-page="audit" class="hover:text-brand-600">Activity</a>
+        ${user.role === 'ADMIN' ? '<a href="#" data-page="admin" class="hover:text-brand-600">Admin</a>' : ''}
+      `;
+      document.getElementById('auth-area').innerHTML = `
+        <span class="text-sm text-slate-600 hidden sm:inline">${user.first_name} ${user.last_name}</span>
+        <button id="logout-btn" class="text-sm text-slate-500 hover:text-red-600">Logout</button>
+      `;
+      document.getElementById('logout-btn').onclick = () => {
+        localStorage.removeItem('lp_access'); localStorage.removeItem('lp_refresh');
+        token = null; refresh = null; user = null; renderLogin();
+      };
+      document.querySelectorAll('[data-page]').forEach(a => a.onclick = (e) => {
+        e.preventDefault();
+        const page = a.dataset.page;
+        if (page === 'dashboard') renderDashboard();
+        if (page === 'memories') renderMemories();
+        if (page === 'timeline') renderTimeline();
+        if (page === 'family') renderFamily();
+        if (page === 'legacy') renderLegacy();
+        if (page === 'media') renderMedia();
+        if (page === 'audit') renderAudit();
+        if (page === 'admin') renderAdmin();
+      });
+      renderDashboard();
+    }
+
+    async function renderDashboard() {
+      show(`
+        <div class="space-y-6">
+          <div>
+            <h1 class="text-2xl font-bold">Welcome, ${user.first_name}</h1>
+            <p class="text-slate-500">Your secure digital legacy hub</p>
+          </div>
+          <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div class="bg-white rounded-xl border p-5"><div class="text-sm text-slate-500">Role</div><div class="text-xl font-semibold mt-1">${user.role}</div></div>
+            <div class="bg-white rounded-xl border p-5"><div class="text-sm text-slate-500">Email</div><div class="text-lg font-medium mt-1 truncate">${user.email}</div></div>
+            <div class="bg-white rounded-xl border p-5"><div class="text-sm text-slate-500">Member since</div><div class="text-lg font-medium mt-1">${new Date(user.created_at).toLocaleDateString()}</div></div>
+            <div class="bg-white rounded-xl border p-5"><div class="text-sm text-slate-500">Profile</div><div class="text-lg font-medium mt-1">${user.profile?.location || 'Not set'}</div></div>
+          </div>
+          <div class="bg-white rounded-xl border p-6">
+            <h2 class="font-semibold mb-3">Quick actions</h2>
+            <div class="flex flex-wrap gap-3">
+              <button onclick="renderMemories()" class="px-4 py-2 bg-brand-50 text-brand-700 rounded-lg text-sm font-medium hover:bg-brand-100">Add Memory</button>
+              <button onclick="renderLegacy()" class="px-4 py-2 bg-brand-50 text-brand-700 rounded-lg text-sm font-medium hover:bg-brand-100">Write Legacy Message</button>
+              <button onclick="renderFamily()" class="px-4 py-2 bg-brand-50 text-brand-700 rounded-lg text-sm font-medium hover:bg-brand-100">Manage Family</button>
+              <button onclick="renderTimeline()" class="px-4 py-2 bg-brand-50 text-brand-700 rounded-lg text-sm font-medium hover:bg-brand-100">Add Life Event</button>
+            </div>
+          </div>
+        </div>
+      `);
+    }
+
+    async function renderMemories() {
+      const res = await api('/memories');
+      const list = res.ok ? await res.json() : [];
+      show(`
+        <div class="space-y-6">
+          <div class="flex items-center justify-between">
+            <h1 class="text-2xl font-bold">Memories</h1>
+            <button id="add-mem" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-medium">+ New Memory</button>
+          </div>
+          <div id="mem-form" class="hidden bg-white border rounded-xl p-6 space-y-4">
+            <input id="mem-title" placeholder="Title" class="w-full border rounded-lg px-3 py-2" />
+            <textarea id="mem-content" placeholder="Your memory..." rows="4" class="w-full border rounded-lg px-3 py-2"></textarea>
+            <input id="mem-location" placeholder="Location (optional)" class="w-full border rounded-lg px-3 py-2" />
+            <button id="save-mem" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm">Save</button>
+          </div>
+          <div class="grid gap-4">
+            ${list.length === 0 ? '<p class="text-slate-500">No memories yet. Create your first one.</p>' : list.map(m => `
+              <div class="bg-white border rounded-xl p-5">
+                <div class="flex justify-between items-start">
+                  <h3 class="font-semibold text-lg">${m.title}</h3>
+                  <button data-del="${m.id}" class="text-red-500 text-sm hover:underline">Delete</button>
+                </div>
+                <p class="text-slate-600 mt-2 whitespace-pre-wrap">${m.content || ''}</p>
+                <div class="mt-3 flex gap-3 text-xs text-slate-400">
+                  ${m.location ? `<span>📍 ${m.location}</span>` : ''}
+                  ${m.memory_date ? `<span>${new Date(m.memory_date).toLocaleDateString()}</span>` : ''}
+                  <span>${(m.tags || []).join(', ')}</span>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `);
+      document.getElementById('add-mem').onclick = () => document.getElementById('mem-form').classList.toggle('hidden');
+      document.getElementById('save-mem').onclick = async () => {
+        const title = document.getElementById('mem-title').value;
+        const content = document.getElementById('mem-content').value;
+        const location = document.getElementById('mem-location').value;
+        if (!title || !content) return toast('Title and content required', 'error');
+        const res = await api('/memories', { method: 'POST', body: JSON.stringify({ title, content, location: location || null, tags: [] }) });
+        if (res.ok) { toast('Memory saved'); renderMemories(); }
+        else toast('Failed', 'error');
+      };
+      document.querySelectorAll('[data-del]').forEach(btn => btn.onclick = async () => {
+        if (!confirm('Delete this memory?')) return;
+        await api(`/memories/${btn.dataset.del}`, { method: 'DELETE' });
+        renderMemories();
+      });
+    }
+
+    async function renderTimeline() {
+      const res = await api('/life-events');
+      const list = res.ok ? await res.json() : [];
+      show(`
+        <div class="space-y-6">
+          <div class="flex items-center justify-between">
+            <h1 class="text-2xl font-bold">Life Timeline</h1>
+            <button id="add-ev" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-medium">+ Event</button>
+          </div>
+          <div id="ev-form" class="hidden bg-white border rounded-xl p-6 space-y-3">
+            <input id="ev-title" placeholder="Title" class="w-full border rounded-lg px-3 py-2" />
+            <textarea id="ev-desc" placeholder="Description" rows="2" class="w-full border rounded-lg px-3 py-2"></textarea>
+            <input id="ev-date" type="date" class="w-full border rounded-lg px-3 py-2" />
+            <select id="ev-cat" class="w-full border rounded-lg px-3 py-2">
+              <option>OTHER</option><option>BIRTH</option><option>MARRIAGE</option><option>GRADUATION</option><option>CAREER</option><option>TRAVEL</option>
+            </select>
+            <button id="save-ev" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm">Save</button>
+          </div>
+          <div class="relative border-l-2 border-brand-200 ml-3 space-y-6">
+            ${list.length === 0 ? '<p class="text-slate-500 ml-6">No life events yet.</p>' : list.map(e => `
+              <div class="ml-6 relative">
+                <div class="absolute -left-[1.6rem] top-1 w-3 h-3 rounded-full bg-brand-500 border-2 border-white"></div>
+                <div class="bg-white border rounded-xl p-4">
+                  <div class="text-xs text-brand-600 font-medium">${e.category} · ${new Date(e.event_date).toLocaleDateString()}</div>
+                  <h3 class="font-semibold mt-1">${e.title}</h3>
+                  ${e.description ? `<p class="text-slate-600 text-sm mt-1">${e.description}</p>` : ''}
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `);
+      document.getElementById('add-ev').onclick = () => document.getElementById('ev-form').classList.toggle('hidden');
+      document.getElementById('save-ev').onclick = async () => {
+        const title = document.getElementById('ev-title').value;
+        const description = document.getElementById('ev-desc').value;
+        const event_date = document.getElementById('ev-date').value;
+        const category = document.getElementById('ev-cat').value;
+        if (!title || !event_date) return toast('Title and date required', 'error');
+        const res = await api('/life-events', { method: 'POST', body: JSON.stringify({ title, description: description || null, event_date: new Date(event_date).toISOString(), category }) });
+        if (res.ok) { toast('Event added'); renderTimeline(); }
+        else toast('Failed', 'error');
+      };
+    }
+
+    async function renderFamily() {
+      const res = await api('/family');
+      const list = res.ok ? await res.json() : [];
+      show(`
+        <div class="space-y-6">
+          <div class="flex items-center justify-between">
+            <h1 class="text-2xl font-bold">Family & Beneficiaries</h1>
+            <button id="add-fam" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-medium">+ Add</button>
+          </div>
+          <div id="fam-form" class="hidden bg-white border rounded-xl p-6 space-y-3">
+            <input id="fam-name" placeholder="Name" class="w-full border rounded-lg px-3 py-2" />
+            <input id="fam-email" placeholder="Email (optional)" class="w-full border rounded-lg px-3 py-2" />
+            <input id="fam-rel" placeholder="Relationship (e.g. Spouse, Child)" class="w-full border rounded-lg px-3 py-2" />
+            <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="fam-ben" /> Beneficiary</label>
+            <label class="flex items-center gap-2 text-sm"><input type="checkbox" id="fam-trust" /> Trusted Contact</label>
+            <button id="save-fam" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm">Save</button>
+          </div>
+          <div class="grid sm:grid-cols-2 gap-4">
+            ${list.length === 0 ? '<p class="text-slate-500">No family members yet.</p>' : list.map(m => `
+              <div class="bg-white border rounded-xl p-5">
+                <div class="flex justify-between">
+                  <h3 class="font-semibold">${m.name}</h3>
+                  <button data-del="${m.id}" class="text-red-500 text-sm">Remove</button>
+                </div>
+                <p class="text-sm text-slate-500">${m.relationship}${m.email ? ' · ' + m.email : ''}</p>
+                <div class="mt-2 flex gap-2">
+                  ${m.is_beneficiary ? '<span class="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded">Beneficiary</span>' : ''}
+                  ${m.is_trusted_contact ? '<span class="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded">Trusted</span>' : ''}
+                  <span class="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded">${m.access_level}</span>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `);
+      document.getElementById('add-fam').onclick = () => document.getElementById('fam-form').classList.toggle('hidden');
+      document.getElementById('save-fam').onclick = async () => {
+        const name = document.getElementById('fam-name').value;
+        const email = document.getElementById('fam-email').value || null;
+        const relationship = document.getElementById('fam-rel').value;
+        const is_beneficiary = document.getElementById('fam-ben').checked;
+        const is_trusted_contact = document.getElementById('fam-trust').checked;
+        if (!name || !relationship) return toast('Name and relationship required', 'error');
+        const res = await api('/family', { method: 'POST', body: JSON.stringify({ name, email, relationship, is_beneficiary, is_trusted_contact, access_level: is_beneficiary ? 'VIEW' : 'NONE' }) });
+        if (res.ok) { toast('Added'); renderFamily(); } else toast('Failed', 'error');
+      };
+      document.querySelectorAll('[data-del]').forEach(btn => btn.onclick = async () => {
+        if (!confirm('Remove?')) return;
+        await api(`/family/${btn.dataset.del}`, { method: 'DELETE' });
+        renderFamily();
+      });
+    }
+
+    async function renderLegacy() {
+      const res = await api('/legacy-messages');
+      const list = res.ok ? await res.json() : [];
+      show(`
+        <div class="space-y-6">
+          <div class="flex items-center justify-between">
+            <h1 class="text-2xl font-bold">Legacy Messages</h1>
+            <button id="add-leg" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-medium">+ Write Message</button>
+          </div>
+          <div id="leg-form" class="hidden bg-white border rounded-xl p-6 space-y-3">
+            <input id="leg-title" placeholder="Title" class="w-full border rounded-lg px-3 py-2" />
+            <textarea id="leg-body" placeholder="Message content (encrypted at rest)" rows="5" class="w-full border rounded-lg px-3 py-2"></textarea>
+            <select id="leg-cond" class="w-full border rounded-lg px-3 py-2"><option value="MANUAL">Manual release</option><option value="SCHEDULED">Scheduled</option></select>
+            <button id="save-leg" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm">Save (encrypted)</button>
+          </div>
+          <div class="space-y-4">
+            ${list.length === 0 ? '<p class="text-slate-500">No legacy messages yet.</p>' : list.map(m => `
+              <div class="bg-white border rounded-xl p-5">
+                <div class="flex justify-between items-start">
+                  <div>
+                    <h3 class="font-semibold text-lg">${m.title}</h3>
+                    <div class="text-xs text-slate-400 mt-1">
+                      ${m.release_condition} · ${m.is_released ? '<span class="text-green-600">Released</span>' : '<span class="text-amber-600">Sealed</span>'}
+                    </div>
+                  </div>
+                  ${!m.is_released ? `<button data-release="${m.id}" class="text-sm bg-amber-100 text-amber-800 px-3 py-1 rounded-lg">Release now</button>` : ''}
+                </div>
+                <p class="mt-3 text-slate-700 whitespace-pre-wrap text-sm bg-slate-50 p-3 rounded-lg">${m.body || ''}</p>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `);
+      document.getElementById('add-leg').onclick = () => document.getElementById('leg-form').classList.toggle('hidden');
+      document.getElementById('save-leg').onclick = async () => {
+        const title = document.getElementById('leg-title').value;
+        const body = document.getElementById('leg-body').value;
+        const release_condition = document.getElementById('leg-cond').value;
+        if (!title || !body) return toast('Required', 'error');
+        const res = await api('/legacy-messages', { method: 'POST', body: JSON.stringify({ title, body, release_condition }) });
+        if (res.ok) { toast('Message sealed & encrypted'); renderLegacy(); } else toast('Failed', 'error');
+      };
+      document.querySelectorAll('[data-release]').forEach(btn => btn.onclick = async () => {
+        if (!confirm('Release this message to beneficiaries? This cannot be undone easily.')) return;
+        const res = await api(`/legacy-messages/${btn.dataset.release}/release`, { method: 'POST' });
+        if (res.ok) { toast('Released'); renderLegacy(); } else toast('Failed', 'error');
+      });
+    }
+
+    async function renderMedia() {
+      const res = await api('/media');
+      const list = res.ok ? await res.json() : [];
+      show(`
+        <div class="space-y-6">
+          <h1 class="text-2xl font-bold">Photos & Documents</h1>
+          <div class="bg-white border rounded-xl p-6">
+            <form id="upload-form" class="flex flex-col sm:flex-row gap-3 items-end">
+              <div class="flex-1"><label class="text-sm font-medium">File</label><input type="file" id="file-input" class="w-full text-sm" /></div>
+              <select id="file-type" class="border rounded-lg px-3 py-2"><option value="DOCUMENT">Document</option><option value="PHOTO">Photo</option></select>
+              <button type="submit" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm">Upload (encrypted)</button>
+            </form>
+          </div>
+          <div class="grid sm:grid-cols-2 gap-4">
+            ${list.length === 0 ? '<p class="text-slate-500">No files uploaded.</p>' : list.map(a => `
+              <div class="bg-white border rounded-xl p-4 flex justify-between items-center">
+                <div>
+                  <div class="font-medium truncate max-w-[200px]">${a.original_name}</div>
+                  <div class="text-xs text-slate-400">${a.type} · ${(a.size/1024).toFixed(1)} KB</div>
+                </div>
+                <a href="${API}/media/${a.id}/download" class="text-brand-600 text-sm font-medium" onclick="event.preventDefault(); downloadFile('${a.id}', '${a.original_name}')">Download</a>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `);
+      document.getElementById('upload-form').onsubmit = async (e) => {
+        e.preventDefault();
+        const file = document.getElementById('file-input').files[0];
+        if (!file) return toast('Select a file', 'error');
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('type', document.getElementById('file-type').value);
+        const res = await fetch(`${API}/media`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}` },
+          body: fd
+        });
+        if (res.ok) { toast('Uploaded & encrypted'); renderMedia(); } else toast('Upload failed', 'error');
+      };
+    }
+
+    async function downloadFile(id, name) {
+      const res = await fetch(`${API}/media/${id}/download`, { headers: { 'Authorization': `Bearer ${token}` } });
+      if (!res.ok) return toast('Download failed', 'error');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = name; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    async function renderAudit() {
+      const res = await api('/audit');
+      const list = res.ok ? await res.json() : [];
+      show(`
+        <div class="space-y-6">
+          <h1 class="text-2xl font-bold">Activity / Audit Log</h1>
+          <div class="bg-white border rounded-xl overflow-hidden">
+            <table class="w-full text-sm">
+              <thead class="bg-slate-50 text-left"><tr><th class="px-4 py-3">Action</th><th class="px-4 py-3">Resource</th><th class="px-4 py-3">Time</th><th class="px-4 py-3">IP</th></tr></thead>
+              <tbody>
+                ${list.length === 0 ? '<tr><td colspan="4" class="px-4 py-6 text-slate-500">No activity yet.</td></tr>' : list.map(l => `
+                  <tr class="border-t"><td class="px-4 py-2 font-medium">${l.action}</td><td class="px-4 py-2">${l.resource_type || '-'} ${l.resource_id ? l.resource_id.slice(0,8)+'…' : ''}</td><td class="px-4 py-2 text-slate-500">${new Date(l.created_at).toLocaleString()}</td><td class="px-4 py-2 text-slate-400">${l.ip_address || '-'}</td></tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `);
+    }
+
+    async function renderAdmin() {
+      const [usersRes, statsRes] = await Promise.all([api('/admin/users'), api('/admin/stats')]);
+      const users = usersRes.ok ? await usersRes.json() : [];
+      const stats = statsRes.ok ? await statsRes.json() : {};
+      show(`
+        <div class="space-y-6">
+          <h1 class="text-2xl font-bold">Admin Dashboard</h1>
+          <div class="grid sm:grid-cols-3 lg:grid-cols-5 gap-4">
+            ${Object.entries(stats).map(([k,v]) => `<div class="bg-white border rounded-xl p-4"><div class="text-xs text-slate-500 uppercase">${k.replace('_',' ')}</div><div class="text-2xl font-bold mt-1">${v}</div></div>`).join('')}
+          </div>
+          <div class="bg-white border rounded-xl overflow-hidden">
+            <table class="w-full text-sm">
+              <thead class="bg-slate-50"><tr><th class="px-4 py-3 text-left">User</th><th class="px-4 py-3">Role</th><th class="px-4 py-3">Status</th><th class="px-4 py-3">Joined</th></tr></thead>
+              <tbody>
+                ${users.map(u => `<tr class="border-t"><td class="px-4 py-2">${u.first_name} ${u.last_name}<div class="text-xs text-slate-400">${u.email}</div></td><td class="px-4 py-2 text-center">${u.role}</td><td class="px-4 py-2 text-center">${u.is_active ? 'Active' : 'Inactive'}</td><td class="px-4 py-2 text-center text-slate-500">${new Date(u.created_at).toLocaleDateString()}</td></tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `);
+    }
+
+    // Boot
+    (async () => {
+      if (token) {
+        await loadUser();
+        if (user) renderApp();
+        else renderLogin();
+      } else renderLogin();
+    })();
+  </script>
+</body>
+</html>
