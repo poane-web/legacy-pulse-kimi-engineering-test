@@ -23,6 +23,17 @@ from app.core.confirmation_tokens import (
 )
 
 
+# A small, structurally plausible PDF fixture. The test should exercise the
+# upload validator with a real PDF header rather than arbitrary "fake content".
+MINIMAL_PDF = (
+    b"%PDF-1.4\n"
+    b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+    b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+    b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>\nendobj\n"
+    b"trailer\n<< /Root 1 0 R >>\n%%EOF\n"
+)
+
+
 # ---------- File validation ----------
 
 def test_reject_empty_file():
@@ -44,8 +55,7 @@ def test_reject_unknown_magic():
 
 
 def test_accept_pdf():
-    data = b"%PDF-1.4 fake content for test"
-    meta = validate_upload(data, "will.pdf", "DOCUMENT", 10_000_000)
+    meta = validate_upload(MINIMAL_PDF, "will.pdf", "DOCUMENT", 10_000_000)
     assert meta["mime_type"] == "application/pdf"
     assert meta["media_type"] == "DOCUMENT"
     assert meta["safe_name"] == "will.pdf"
