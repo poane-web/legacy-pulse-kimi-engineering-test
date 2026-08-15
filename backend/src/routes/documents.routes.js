@@ -23,10 +23,18 @@ router.get('/', asyncHandler(async (req,res) => { const rows=db.prepare('SELECT 
 router.post('/', upload.single('file'), [body('description').optional().isString().isLength({max:2000})], handleValidation, asyncHandler(async(req,res)=>{
   if(!req.file) throw new BadRequestError('No file provided (field name must be "file")');
   if(!matchesDeclaredMime(req.file.buffer, req.file.mimetype)) throw new BadRequestError('File content does not match the declared file type');
+
+  // Persist the encrypted blob first, but treat the DB insert as a transaction
+  // boundary: if persistence fails, remove the orphaned blob immediately.
   const saved=storage.save(req.file.buffer);
-  const info=db.prepare(`INSERT INTO documents (owner_id, original_filename_encrypted, stored_filename, mime_type, size_bytes, description_encrypted, file_iv, file_auth_tag, checksum_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(req.user.id,encryptField(req.file.originalname),saved.storedFilename,req.file.mimetype,saved.sizeBytes,req.body.description?encryptField(req.body.description):null,saved.iv,saved.authTag,saved.checksum);
-  logAudit({actorUserId:req.user.id,action:'document.uploaded',targetType:'document',targetId:info.lastInsertRowid,ip:req.ip,metadata:{mimeType:req.file.mimetype,sizeBytes:saved.sizeBytes}});
-  res.status(201).json({document:toDTO(db.prepare('SELECT * FROM documents WHERE id = ?').get(info.lastInsertRowid))});
+  try {
+    const info=db.prepare(`INSERT INTO documents (owner_id, original_filename_encrypted, stored_filename, mime_type, size_bytes, description_encrypted, file_iv, file_auth_tag, checksum_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(req.user.id,encryptField(req.file.originalname),saved.storedFilename,req.file.mimetype,saved.sizeBytes,req.body.description?encryptField(req.body.description):null,saved.iv,saved.authTag,saved.checksum);
+    logAudit({actorUserId:req.user.id,action:'document.uploaded',targetType:'document',targetId:info.lastInsertRowid,ip:req.ip,metadata:{mimeType:req.file.mimetype,sizeBytes:saved.sizeBytes}});
+    res.status(201).json({document:toDTO(db.prepare('SELECT * FROM documents WHERE id = ?').get(info.lastInsertRowid))});
+  } catch (err) {
+    try { storage.remove(saved.storedFilename); } catch (_) { /* preserve the original DB error */ }
+    throw err;
+  }
 }));
 router.get('/:id/download', requireOwnership(req=>db.prepare('SELECT * FROM documents WHERE id = ?').get(req.params.id),'document'), asyncHandler(async(req,res)=>{
   const row=req.resource; const plaintext=storage.read(row.stored_filename,row.file_iv,row.file_auth_tag,row.checksum_sha256); logAudit({actorUserId:req.user.id,action:'document.downloaded',targetType:'document',targetId:row.id,ip:req.ip});
