@@ -1,0 +1,70 @@
+// Builds the Express app without starting the HTTP listener or the cron
+// scheduler — this separation lets tests `require('../app')` and drive it
+// with supertest without binding a port or running background jobs.
+'use strict';
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const cookieParser = require('cookie-parser');
+const morgan = require('morgan');
+
+const config = require('./config/env');
+const { globalLimiter } = require('./middleware/rateLimit');
+const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
+
+const authRoutes = require('./routes/auth.routes');
+const usersRoutes = require('./routes/users.routes');
+const beneficiariesRoutes = require('./routes/beneficiaries.routes');
+const trustedContactsRoutes = require('./routes/trustedContacts.routes');
+const memoriesRoutes = require('./routes/memories.routes');
+const timelineRoutes = require('./routes/timeline.routes');
+const documentsRoutes = require('./routes/documents.routes');
+const photosRoutes = require('./routes/photos.routes');
+const legacyMessagesRoutes = require('./routes/legacyMessages.routes');
+const adminRoutes = require('./routes/admin.routes');
+const searchRoutes = require('./routes/search.routes');
+const notificationsRoutes = require('./routes/notifications.routes');
+const auditRoutes = require('./routes/audit.routes');
+const securityRoutes = require('./routes/security.routes');
+
+function createApp() {
+  const app = express();
+
+  app.disable('x-powered-by');
+  app.use(helmet());
+  app.use(cors({ origin: config.clientOrigin, credentials: true }));
+  app.use(express.json({ limit: '1mb' }));
+  app.use(cookieParser());
+  // Never log request bodies — they can contain passwords or legacy
+  // message content. `morgan('combined')`-style logs method/path/status
+  // only, not the body.
+  if (config.nodeEnv !== 'test') {
+    app.use(morgan(config.nodeEnv === 'production' ? 'combined' : 'dev'));
+  }
+  app.use('/api', globalLimiter);
+
+  app.get('/api/health', (req, res) => res.json({ status: 'ok', env: config.nodeEnv }));
+
+  app.use('/api/auth', authRoutes.router);
+  app.use('/api/users', usersRoutes);
+  app.use('/api/beneficiaries', beneficiariesRoutes);
+  app.use('/api/trusted-contacts', trustedContactsRoutes);
+  app.use('/api/memories', memoriesRoutes);
+  app.use('/api/timeline', timelineRoutes);
+  app.use('/api/documents', documentsRoutes);
+  app.use('/api/photos', photosRoutes);
+  app.use('/api/legacy-messages', legacyMessagesRoutes);
+  app.use('/api/admin', adminRoutes);
+  app.use('/api/search', searchRoutes);
+  app.use('/api/notifications', notificationsRoutes);
+  app.use('/api/audit', auditRoutes);
+  app.use('/api/security', securityRoutes);
+
+  app.use('/api', notFoundHandler);
+  app.use(errorHandler);
+
+  return app;
+}
+
+module.exports = createApp;
