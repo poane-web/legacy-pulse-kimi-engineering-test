@@ -1,21 +1,22 @@
-// Applies schema.sql (idempotent: uses CREATE TABLE IF NOT EXISTS) and
-// records a migration marker. In a larger system this would iterate over
-// numbered files in ./migrations; schema.sql is intentionally the single
-// source of truth for this MVP's schema, documented in docs/DATABASE.md.
+// Applies the base schema and then numbered forward migrations.
 'use strict';
-
-const fs = require('fs');
-const path = require('path');
-const db = require('./index');
-
-const schemaPath = path.join(__dirname, 'schema.sql');
-const schema = fs.readFileSync(schemaPath, 'utf8');
-
+const fs = require('fs'); const path = require('path'); const db = require('./index');
+const schema = fs.readFileSync(path.join(__dirname,'schema.sql'),'utf8');
 db.exec(schema);
-
-const already = db.prepare('SELECT 1 FROM schema_migrations WHERE name = ?').get('initial_schema');
-if (!already) {
-  db.prepare('INSERT INTO schema_migrations (name) VALUES (?)').run('initial_schema');
+const migrationsDir = path.join(__dirname,'migrations');
+if (fs.existsSync(migrationsDir)) {
+  for (const name of fs.readdirSync(migrationsDir).filter(n=>/^\d+_.+\.sql$/.test(n)).sort()) {
+    if (db.prepare('SELECT 1 FROM schema_migrations WHERE name = ?').get(name)) continue;
+    const sql=fs.readFileSync(path.join(migrationsDir,name),'utf8');
+    const apply=db.transaction(()=>{ db.exec(sql); db.prepare('INSERT INTO schema_migrations (name) VALUES (?)').run(name); });
+    try { apply(); } catch (err) {
+      // The base schema may already contain a column introduced by a later
+      // migration (fresh clones). Treat that specific SQLite duplicate-column
+      // case as already applied; all other migration errors are fatal.
+      if (/duplicate column name/i.test(String(err.message))) db.prepare('INSERT INTO schema_migrations (name) VALUES (?)').run(name);
+      else throw err;
+    }
+  }
 }
-
-console.log(`[migrate] schema applied to ${db.name}`);
+if (!db.prepare('SELECT 1 FROM schema_migrations WHERE name = ?').get('initial_schema')) db.prepare('INSERT INTO schema_migrations (name) VALUES (?)').run('initial_schema');
+console.log(`[migrate] schema and migrations applied to ${db.name}`);
