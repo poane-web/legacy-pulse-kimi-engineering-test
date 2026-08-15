@@ -13,6 +13,7 @@ const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { encryptField, decryptField } = require('../utils/crypto');
 const storage = require('../services/storage');
+const { contentMatchesDeclaredType } = require('../utils/fileSignature');
 const { BadRequestError } = require('../utils/errors');
 
 const router = express.Router();
@@ -62,6 +63,12 @@ router.post(
   handleValidation,
   asyncHandler(async (req, res) => {
     if (!req.file) throw new BadRequestError('No file provided (field name must be "file")');
+    // V2.0-B (H4): verify actual bytes match the declared (and allowed)
+    // image type — see documents.routes.js for the full rationale.
+    if (!contentMatchesDeclaredType(req.file.buffer, req.file.mimetype)) {
+      logAudit({ actorUserId: req.user.id, action: 'photo.upload_rejected_signature_mismatch', ip: req.ip, metadata: { declaredMimeType: req.file.mimetype } });
+      throw new BadRequestError('File content does not match its declared type');
+    }
 
     // If linking to a memory/life-event, verify ownership to prevent
     // attaching a photo to another user's resource.
@@ -103,6 +110,10 @@ router.get(
   asyncHandler(async (req, res) => {
     const row = req.resource;
     const plaintext = storage.read(row.stored_filename, row.file_iv, row.file_auth_tag, row.checksum_sha256);
+    // V2.0-B (M4): documents.routes.js already logged successful downloads;
+    // photos didn't, leaving an audit-coverage gap for a resource type this
+    // product's activity log is supposed to cover.
+    logAudit({ actorUserId: req.user.id, action: 'photo.downloaded', targetType: 'photo', targetId: row.id, ip: req.ip });
     res.setHeader('Content-Type', row.mime_type);
     res.send(plaintext);
   })

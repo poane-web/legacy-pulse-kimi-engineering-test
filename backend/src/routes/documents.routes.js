@@ -13,6 +13,7 @@ const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { encryptField, decryptField } = require('../utils/crypto');
 const storage = require('../services/storage');
+const { contentMatchesDeclaredType } = require('../utils/fileSignature');
 const { BadRequestError } = require('../utils/errors');
 
 const router = express.Router();
@@ -66,6 +67,14 @@ router.post(
   handleValidation,
   asyncHandler(async (req, res) => {
     if (!req.file) throw new BadRequestError('No file provided (field name must be "file")');
+    // V2.0-B (H4): the multer fileFilter only checked the client-supplied
+    // Content-Type header, which is trivially spoofable. Now that the full
+    // buffer is available, verify the actual bytes match what was declared
+    // before persisting/encrypting it.
+    if (!contentMatchesDeclaredType(req.file.buffer, req.file.mimetype)) {
+      logAudit({ actorUserId: req.user.id, action: 'document.upload_rejected_signature_mismatch', ip: req.ip, metadata: { declaredMimeType: req.file.mimetype } });
+      throw new BadRequestError('File content does not match its declared type');
+    }
     const saved = storage.save(req.file.buffer);
 
     const info = db.prepare(
