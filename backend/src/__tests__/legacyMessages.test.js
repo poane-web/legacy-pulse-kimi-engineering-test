@@ -9,8 +9,8 @@ const app = createApp();
 
 async function registerAndLogin(email) {
   const password = 'SuperSecret9';
-  await request(app).post('/api/auth/register').send({ email, password, fullName: email.split('@')[0] });
-  const login = await request(app).post('/api/auth/login').send({ email, password });
+  await request(app).post('/api/auth/register').set('X-Legacy-Pulse-Client', '1').send({ email, password, fullName: email.split('@')[0] });
+  const login = await request(app).post('/api/auth/login').set('X-Legacy-Pulse-Client', '1').send({ email, password });
   return login.body.accessToken;
 }
 
