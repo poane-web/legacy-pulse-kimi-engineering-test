@@ -18,6 +18,20 @@ const config = require('../config/env');
 const { encryptField } = require('../utils/crypto');
 
 async function seed() {
+  // V2.0-B SECURITY FIX (docs/V2_SECURITY_AUDIT.md, finding M3 -- Medium):
+  // this script creates accounts with a password ("DemoPass123!") that is
+  // published in the public README and git history. V1 had no guard
+  // against running it against a real deployment's database by mistake.
+  // Production now refuses unless explicitly overridden.
+  if (config.nodeEnv === 'production' && !config.allowProdSeed) {
+    throw new Error(
+      'Refusing to run the demo seed script with NODE_ENV=production. ' +
+      'This would create publicly-documented admin/owner credentials. ' +
+      'If you really intend to seed a production-configured database ' +
+      '(e.g. a staging environment sharing prod config), set ALLOW_PROD_SEED=true explicitly.'
+    );
+  }
+
   const existing = db.prepare('SELECT id FROM users WHERE email = ?').get('owner@demo.legacypulse.test');
   if (existing) {
     console.log('[seed] Demo data already present, skipping. Delete backend/data/legacy_pulse.db to reset.');
@@ -95,4 +109,11 @@ async function seed() {
   console.log('  Beneficiary: beneficiary@demo.legacypulse.test / DemoPass123!');
 }
 
-seed().then(() => process.exit(0)).catch((err) => { console.error(err); process.exit(1); });
+module.exports = { seed };
+
+// Only run automatically (and exit the process) when invoked directly via
+// `node src/db/seed.js` / `npm run seed` — not when required by a test,
+// which needs to catch the thrown production-guard error itself.
+if (require.main === module) {
+  seed().then(() => process.exit(0)).catch((err) => { console.error(err.message); process.exit(1); });
+}
