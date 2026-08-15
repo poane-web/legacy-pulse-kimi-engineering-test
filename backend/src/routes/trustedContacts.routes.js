@@ -10,7 +10,7 @@ const { requireOwnership } = require('../middleware/rbac');
 const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { sha256Hex, randomToken } = require('../utils/crypto');
-const { NotFoundError, ForbiddenError, ConflictError } = require('../utils/errors');
+const { NotFoundError, ForbiddenError, ConflictError, BadRequestError } = require('../utils/errors');
 const config = require('../config/env');
 
 const router = express.Router();
@@ -78,6 +78,25 @@ router.post(
     const tokenHash = sha256Hex(req.body.token);
     const row = db.prepare('SELECT * FROM trusted_contacts WHERE invite_token_hash = ? AND status = ?').get(tokenHash, 'pending');
     if (!row) throw new NotFoundError('Invite not found or already used');
+    // V2.0-B SECURITY FIX (docs/V2_SECURITY_AUDIT.md, finding C2 -- Critical):
+    // V1 was missing this check entirely, meaning anyone who obtained the
+    // raw invite token (link leakage, forwarding, interception) could claim
+    // trusted-contact status under ANY account, regardless of whether they
+    // were the person the Owner actually intended. Trusted contacts are
+    // half of the two-person release-trigger rule (docs/ARCHITECTURE.md
+    // §6), so this previously let a single attacker undermine that control
+    // by self-assigning as one of the two required confirmers. Mirrors the
+    // equivalent (and already-correct) check in beneficiaries.routes.js.
+    if (row.email.toLowerCase() !== req.user.email.toLowerCase()) {
+      logAudit({
+        actorUserId: req.user.id,
+        action: 'trusted_contact.claim_email_mismatch',
+        targetType: 'trusted_contact',
+        targetId: row.id,
+        ip: req.ip,
+      });
+      throw new BadRequestError('This invite was issued to a different email address');
+    }
     db.prepare('UPDATE trusted_contacts SET linked_user_id = ?, status = ?, invite_token_hash = NULL WHERE id = ?')
       .run(req.user.id, 'active', row.id);
     logAudit({ actorUserId: req.user.id, action: 'trusted_contact.invite_claimed', targetType: 'trusted_contact', targetId: row.id, ip: req.ip });
