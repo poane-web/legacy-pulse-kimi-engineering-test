@@ -9,31 +9,53 @@
 
 require('dotenv').config({ quiet: true });
 
-const REQUIRED_IN_PRODUCTION = [
-  'JWT_ACCESS_SECRET',
-  'JWT_REFRESH_SECRET',
-  'DATA_ENCRYPTION_KEY',
-];
+const crypto = require('crypto');
 
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
-// In development/test we generate ephemeral secrets automatically so the
-// project runs with zero setup friction, but we NEVER do this in
-// production — a missing secret in production must be a hard failure, not
-// a silently-generated one (a restart would otherwise invalidate every
-// session and, worse, a horizontally-scaled deployment would have
-// different instances silently using different keys).
-const crypto = require('crypto');
-function devFallback(name, { isBase64_32 = false } = {}) {
+// ---------------------------------------------------------------------
+// V2 SECURITY FIX (docs/V2_SECURITY_AUDIT.md, finding C1 -- Critical)
+//
+// V1 generated a *deterministic* fallback secret outside NODE_ENV=production
+// by hashing a fixed, public string (sha256(name + '-dev-only-fallback')).
+// Because that string is public (this repository), anyone could compute
+// the exact same secret offline. If the app were ever run with NODE_ENV
+// unset, 'development', 'staging', or anything other than the literal
+// string 'production' -- a common real-world misconfiguration -- an
+// attacker who simply read this source code could forge admin JWTs and
+// derive the data encryption key, with zero credentials.
+//
+// The fix: the fallback is now a RANDOM value (crypto.randomBytes), unique
+// per process start, never derivable from source code, and never
+// persisted. This preserves the original developer-experience goal (the
+// app still runs immediately with no .env file) while removing the
+// critical vulnerability. The trade-off -- sessions/encrypted data don't
+// survive a process restart without a real .env -- is an acceptable,
+// intentional cost for local development; it is not a change to any
+// production security guarantee (production still requires real secrets
+// and refuses to start without them, exactly as before).
+// ---------------------------------------------------------------------
+let warnedAboutEphemeralSecrets = false;
+function ephemeralDevFallback(name, { isBase64_32 = false } = {}) {
   if (NODE_ENV === 'production') return undefined;
-  // Deterministic-per-process, not persisted — fine for local dev/test only.
-  const digest = crypto.createHash('sha256').update(name + '-dev-only-fallback');
-  return isBase64_32 ? digest.digest('base64') : digest.digest('hex');
+  if (!warnedAboutEphemeralSecrets && NODE_ENV !== 'test') {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '\n[config] WARNING: one or more security secrets are not set in the environment.\n' +
+      '  Using RANDOM, process-local, non-persistent fallback values.\n' +
+      '  This is fine for local development only -- set real values in a\n' +
+      '  .env file (see .env.example) before anything resembling a real\n' +
+      '  deployment. These fallbacks change every restart and invalidate\n' +
+      '  all sessions and encrypted data when they do.\n'
+    );
+    warnedAboutEphemeralSecrets = true;
+  }
+  return isBase64_32 ? crypto.randomBytes(32).toString('base64') : crypto.randomBytes(48).toString('hex');
 }
 
 function required(name, { isBase64_32 = false } = {}) {
   let value = process.env[name];
-  if (!value) value = devFallback(name, { isBase64_32 });
+  if (!value) value = ephemeralDevFallback(name, { isBase64_32 });
   if (!value) {
     throw new Error(
       `Missing required environment variable ${name}. See .env.example. ` +
@@ -78,6 +100,10 @@ const config = {
   // itself in fixture-heavy tests elsewhere (high default limit). See
   // AUTH_RATE_LIMIT_MAX in .env.example.
   authRateLimitMax: parseInt(process.env.AUTH_RATE_LIMIT_MAX || (NODE_ENV === 'test' ? '200' : '10'), 10),
+
+  // V2.0-B (M3): seed.js refuses to run against a database started with
+  // NODE_ENV=production unless this is explicitly set -- see db/seed.js.
+  allowProdSeed: process.env.ALLOW_PROD_SEED === 'true',
 };
 
 module.exports = config;
