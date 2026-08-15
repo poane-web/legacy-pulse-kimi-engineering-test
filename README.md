@@ -20,6 +20,16 @@ Requires Node.js 18+ (developed on Node 22).
 ```bash
 cd backend
 npm install
+```
+
+> **Note on `npm install`**: `better-sqlite3` is a native module. `npm install` will
+> either fetch a prebuilt binary or compile it locally via `node-gyp`, both of
+> which require normal outbound internet access (to GitHub release assets
+> and/or `nodejs.org`). If you're behind a restrictive firewall/proxy and the
+> build fails, the usual native-module troubleshooting applies (ensure Python
+> 3 and build tools are installed, or unblock `nodejs.org`).
+
+```bash
 cp ../.env.example .env
 # Edit .env: at minimum set JWT_ACCESS_SECRET, JWT_REFRESH_SECRET, and
 # DATA_ENCRYPTION_KEY. Generate values with:
