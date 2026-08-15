@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from app.core.middleware import SecurityHeadersMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +37,13 @@ from app.models.schemas import (
     MediaResponse, NotificationResponse, AuditLogResponse, MessageResponse
 )
 from app.services.audit import log_action
+from app.utils.files import validate_upload, content_disposition_attachment, FileValidationError
+from app.core.step_up import (
+    StepUpRequest, StepUpTokenResponse, create_step_up_token, verify_step_up_token,
+    SCOPE_RELEASE_FINALIZE, SCOPE_BENEFICIARY_CHANGE, SCOPE_TRUSTED_CONTACT_CHANGE,
+    SCOPE_PASSWORD_CHANGE, SCOPE_SENSITIVE,
+)
+from app.core.confirmation_tokens import issue_confirmation_token, verify_confirmation_token
 from app.services.rate_limit import is_rate_limited, record_attempt, clear_attempts
 from app.services.release_engine import (
     owner_request_release, finalize_release, cancel_release,
@@ -61,6 +69,8 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 # Ensure upload dir exists
 Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
@@ -339,6 +349,50 @@ def logout(
 
 
 # ---------- User ----------
+
+
+@app.post("/api/auth/step-up", response_model=StepUpTokenResponse)
+def step_up(
+    body: StepUpRequest,
+    scope: str = "sensitive",
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Re-authenticate with password to obtain a short-lived step-up token."""
+    if not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    allowed = {
+        SCOPE_SENSITIVE, SCOPE_RELEASE_FINALIZE, SCOPE_BENEFICIARY_CHANGE,
+        SCOPE_TRUSTED_CONTACT_CHANGE, SCOPE_PASSWORD_CHANGE,
+    }
+    if scope not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid step-up scope")
+    token = create_step_up_token(user.id, scope)
+    return StepUpTokenResponse(step_up_token=token, expires_in=300, scope=scope)
+
+
+@app.post("/api/auth/change-password", response_model=MessageResponse)
+def change_password(
+    body: StepUpRequest,
+    new_password: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    """Change password requires current password (step-up equivalent)."""
+    if not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid current password")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password too short")
+    user.password_hash = hash_password(new_password)
+    # Revoke all refresh tokens
+    for rt in db.query(RefreshToken).filter(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None)).all():
+        rt.revoked_at = datetime.utcnow()
+    db.commit()
+    log_action(db, "PASSWORD_CHANGE", actor_id=user.id)
+    return MessageResponse(message="Password changed; please log in again")
+
+
 @app.get("/api/users/me", response_model=UserResponse)
 def get_me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     profile = db.query(Profile).filter(Profile.user_id == user.id).first()
@@ -406,6 +460,21 @@ def create_family(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # Step-up required when granting beneficiary or trusted-contact status
+    if body.is_beneficiary or body.is_trusted_contact:
+        step_token = request.headers.get("X-Step-Up-Token")
+        scope = SCOPE_BENEFICIARY_CHANGE if body.is_beneficiary else SCOPE_TRUSTED_CONTACT_CHANGE
+        if body.is_beneficiary and body.is_trusted_contact:
+            scope = SCOPE_SENSITIVE
+        if not step_token or not verify_step_up_token(step_token, user.id, scope):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "STEP_UP_REQUIRED",
+                    "message": "Re-authenticate via POST /api/auth/step-up before changing beneficiaries or trusted contacts",
+                    "scope": scope,
+                },
+            )
     notes_enc, notes_iv = None, None
     if body.notes:
         notes_enc, notes_iv, _ = encrypt_text(body.notes)
@@ -651,6 +720,16 @@ def release_legacy_message(
     ip, ua = get_client_info(request)
     try:
         if msg.owner_id == user.id:
+            step_token = request.headers.get("X-Step-Up-Token")
+            if not step_token or not verify_step_up_token(step_token, user.id, SCOPE_RELEASE_FINALIZE):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "STEP_UP_REQUIRED",
+                        "message": "Re-authenticate via POST /api/auth/step-up before releasing a legacy message",
+                        "scope": SCOPE_RELEASE_FINALIZE,
+                    },
+                )
             owner_request_release(db, msg, user, ip, ua)
         elif user.role == Role.ADMIN:
             # Admin may only finalize an already PENDING release, not start from ACTIVE
@@ -747,15 +826,20 @@ async def upload_media(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if file.size and file.size > settings.MAX_UPLOAD_SIZE:
-        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
     content = await file.read()
-    if len(content) > settings.MAX_UPLOAD_SIZE:
-        raise HTTPException(status_code=400, detail="File too large")
+    try:
+        meta = validate_upload(
+            content,
+            original_name=file.filename,
+            claimed_type=type,
+            max_size=settings.MAX_UPLOAD_SIZE,
+        )
+    except FileValidationError as e:
+        raise HTTPException(status_code=400, detail={"code": e.code, "message": e.message})
 
-    media_type = MediaType.PHOTO if type.upper() == "PHOTO" else MediaType.DOCUMENT
+    media_type = MediaType.PHOTO if meta["media_type"] == "PHOTO" else MediaType.DOCUMENT
     ciphertext, iv = encrypt_file(content)
-    storage_name = str(uuid.uuid4())
+    storage_name = meta["storage_name"]
     path = Path(settings.UPLOAD_DIR) / storage_name
     path.write_bytes(ciphertext)
 
@@ -764,11 +848,12 @@ async def upload_media(
         owner_id=user.id,
         memory_id=memory_id,
         type=media_type,
-        original_name=file.filename or "unknown",
-        mime_type=file.content_type or "application/octet-stream",
-        size=len(content),
+        original_name=meta["safe_name"],
+        mime_type=meta["mime_type"],
+        size=meta["size"],
         storage_path=storage_name,
         encryption_iv=iv.hex(),
+        encryption_version=1,
     )
     db.add(asset)
     db.commit()
@@ -811,7 +896,7 @@ def download_media(
     return StreamingResponse(
         iter([plaintext]),
         media_type=asset.mime_type,
-        headers={"Content-Disposition": f'attachment; filename="{asset.original_name}"'},
+        headers={"Content-Disposition": content_disposition_attachment(asset.original_name)},
     )
 
 

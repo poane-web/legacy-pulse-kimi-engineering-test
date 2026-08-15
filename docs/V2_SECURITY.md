@@ -109,3 +109,35 @@ PYTHONPATH=. python3 -m pytest tests/ -v
 cp .env.example .env   # set real secrets
 PYTHONPATH=. uvicorn app.main:app --host 0.0.0.0 --port 3001
 ```
+
+---
+
+## V2.1 — Remaining vulnerability fixes
+
+### Fixed in code
+
+| Item | Implementation |
+|------|----------------|
+| Magic-byte file validation | `app/utils/files.py` — signatures for JPEG/PNG/GIF/WebP/PDF/ZIP/OLE; extension whitelist; MIME/extension mismatch rejection |
+| Path traversal / filename injection | `sanitize_filename` + safe `Content-Disposition` |
+| XSS in SPA | `escapeHtml()` applied to user-controlled fields in `static/index.html` |
+| Step-up authentication | `POST /api/auth/step-up`; required for beneficiary/TC grants and legacy release (`X-Step-Up-Token`) |
+| Password change | `POST /api/auth/change-password` (revokes all sessions) |
+| Signed confirmation tokens | `app/core/confirmation_tokens.py` — HMAC-bound, state-bound, expiring |
+| Security headers | CSP, X-Frame-Options, nosniff, Referrer-Policy, Permissions-Policy, HSTS on HTTPS |
+
+### Still requires production infrastructure
+
+| Item | Why |
+|------|-----|
+| KMS/HSM master key | Needs cloud KMS or hardware; `KeyProvider` is ready |
+| External immutable audit | DB admin can still rewrite tables; needs WORM log / SIEM |
+| Independent trusted-contact login | Product + identity design beyond signed tokens |
+| Full MFA (TOTP/WebAuthn) | Step-up is MFA-ready; provider integration remaining |
+| httpOnly cookie sessions | SPA architecture change; localStorage still used |
+| Alembic + PostgreSQL | Operational migration tooling |
+| Pen test / formal audit | External |
+
+### Tests
+
+29 automated tests passing (auth, crypto, release transitions, rate limit, file validation, step-up, confirmation tokens).

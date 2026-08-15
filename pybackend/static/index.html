@@ -51,6 +51,16 @@
 
   <script>
     const API = 'http://localhost:3001/api';
+    function escapeHtml(s) {
+      if (s == null) return '';
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     let token = localStorage.getItem('lp_access') || null;
     let refresh = localStorage.getItem('lp_refresh') || null;
     let user = null;
@@ -178,7 +188,7 @@
         ${user.role === 'ADMIN' ? '<a href="#" data-page="admin" class="hover:text-brand-600">Admin</a>' : ''}
       `;
       document.getElementById('auth-area').innerHTML = `
-        <span class="text-sm text-slate-600 hidden sm:inline">${user.first_name} ${user.last_name}</span>
+        <span class="text-sm text-slate-600 hidden sm:inline">${escapeHtml(user.first_name)} ${escapeHtml(user.last_name)}</span>
         <button id="logout-btn" class="text-sm text-slate-500 hover:text-red-600">Logout</button>
       `;
       document.getElementById('logout-btn').onclick = () => {
@@ -204,12 +214,12 @@
       show(`
         <div class="space-y-6">
           <div>
-            <h1 class="text-2xl font-bold">Welcome, ${user.first_name}</h1>
+            <h1 class="text-2xl font-bold">Welcome, ${escapeHtml(user.first_name)}</h1>
             <p class="text-slate-500">Your secure digital legacy hub</p>
           </div>
           <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <div class="bg-white rounded-xl border p-5"><div class="text-sm text-slate-500">Role</div><div class="text-xl font-semibold mt-1">${user.role}</div></div>
-            <div class="bg-white rounded-xl border p-5"><div class="text-sm text-slate-500">Email</div><div class="text-lg font-medium mt-1 truncate">${user.email}</div></div>
+            <div class="bg-white rounded-xl border p-5"><div class="text-sm text-slate-500">Email</div><div class="text-lg font-medium mt-1 truncate">${escapeHtml(user.email)}</div></div>
             <div class="bg-white rounded-xl border p-5"><div class="text-sm text-slate-500">Member since</div><div class="text-lg font-medium mt-1">${new Date(user.created_at).toLocaleDateString()}</div></div>
             <div class="bg-white rounded-xl border p-5"><div class="text-sm text-slate-500">Profile</div><div class="text-lg font-medium mt-1">${user.profile?.location || 'Not set'}</div></div>
           </div>
@@ -245,10 +255,10 @@
             ${list.length === 0 ? '<p class="text-slate-500">No memories yet. Create your first one.</p>' : list.map(m => `
               <div class="bg-white border rounded-xl p-5">
                 <div class="flex justify-between items-start">
-                  <h3 class="font-semibold text-lg">${m.title}</h3>
+                  <h3 class="font-semibold text-lg">${escapeHtml(m.title)}</h3>
                   <button data-del="${m.id}" class="text-red-500 text-sm hover:underline">Delete</button>
                 </div>
-                <p class="text-slate-600 mt-2 whitespace-pre-wrap">${m.content || ''}</p>
+                <p class="text-slate-600 mt-2 whitespace-pre-wrap">${escapeHtml(m.content || '')}</p>
                 <div class="mt-3 flex gap-3 text-xs text-slate-400">
                   ${m.location ? `<span>📍 ${m.location}</span>` : ''}
                   ${m.memory_date ? `<span>${new Date(m.memory_date).toLocaleDateString()}</span>` : ''}
@@ -300,8 +310,8 @@
                 <div class="absolute -left-[1.6rem] top-1 w-3 h-3 rounded-full bg-brand-500 border-2 border-white"></div>
                 <div class="bg-white border rounded-xl p-4">
                   <div class="text-xs text-brand-600 font-medium">${e.category} · ${new Date(e.event_date).toLocaleDateString()}</div>
-                  <h3 class="font-semibold mt-1">${e.title}</h3>
-                  ${e.description ? `<p class="text-slate-600 text-sm mt-1">${e.description}</p>` : ''}
+                  <h3 class="font-semibold mt-1">${escapeHtml(e.title)}</h3>
+                  ${e.description ? `<p class="text-slate-600 text-sm mt-1">${escapeHtml(e.description || '')}</p>` : ''}
                 </div>
               </div>
             `).join('')}
@@ -342,7 +352,7 @@
             ${list.length === 0 ? '<p class="text-slate-500">No family members yet.</p>' : list.map(m => `
               <div class="bg-white border rounded-xl p-5">
                 <div class="flex justify-between">
-                  <h3 class="font-semibold">${m.name}</h3>
+                  <h3 class="font-semibold">${escapeHtml(m.name)}</h3>
                   <button data-del="${m.id}" class="text-red-500 text-sm">Remove</button>
                 </div>
                 <p class="text-sm text-slate-500">${m.relationship}${m.email ? ' · ' + m.email : ''}</p>
@@ -394,14 +404,14 @@
               <div class="bg-white border rounded-xl p-5">
                 <div class="flex justify-between items-start">
                   <div>
-                    <h3 class="font-semibold text-lg">${m.title}</h3>
+                    <h3 class="font-semibold text-lg">${escapeHtml(m.title)}</h3>
                     <div class="text-xs text-slate-400 mt-1">
                       ${m.release_condition} · ${m.is_released ? '<span class="text-green-600">Released</span>' : '<span class="text-amber-600">Sealed</span>'}
                     </div>
                   </div>
                   ${!m.is_released ? `<button data-release="${m.id}" class="text-sm bg-amber-100 text-amber-800 px-3 py-1 rounded-lg">Release now</button>` : ''}
                 </div>
-                <p class="mt-3 text-slate-700 whitespace-pre-wrap text-sm bg-slate-50 p-3 rounded-lg">${m.body || ''}</p>
+                <p class="mt-3 text-slate-700 whitespace-pre-wrap text-sm bg-slate-50 p-3 rounded-lg">${escapeHtml(m.body || '')}</p>
               </div>
             `).join('')}
           </div>
@@ -440,10 +450,10 @@
             ${list.length === 0 ? '<p class="text-slate-500">No files uploaded.</p>' : list.map(a => `
               <div class="bg-white border rounded-xl p-4 flex justify-between items-center">
                 <div>
-                  <div class="font-medium truncate max-w-[200px]">${a.original_name}</div>
+                  <div class="font-medium truncate max-w-[200px]">${escapeHtml(a.original_name)}</div>
                   <div class="text-xs text-slate-400">${a.type} · ${(a.size/1024).toFixed(1)} KB</div>
                 </div>
-                <a href="${API}/media/${a.id}/download" class="text-brand-600 text-sm font-medium" onclick="event.preventDefault(); downloadFile('${a.id}', '${a.original_name}')">Download</a>
+                <a href="${API}/media/${a.id}/download" class="text-brand-600 text-sm font-medium" onclick="event.preventDefault(); downloadFile('${a.id}', '${escapeHtml(a.original_name)}')">Download</a>
               </div>
             `).join('')}
           </div>
