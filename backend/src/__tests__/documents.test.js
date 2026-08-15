@@ -16,6 +16,14 @@ async function registerAndLogin(email) {
   return login.body.accessToken;
 }
 
+// The V2 upload path deliberately validates file magic bytes. This is a
+// minimal syntactically plausible PDF fixture rather than arbitrary text
+// merely labelled as application/pdf.
+const PDF_FIXTURE = Buffer.from(
+  '%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n',
+  'ascii',
+);
+
 describe('Document upload/download', () => {
   let token;
   let documentId;
@@ -29,7 +37,7 @@ describe('Document upload/download', () => {
       .post('/api/documents')
       .set('Authorization', `Bearer ${token}`)
       .field('description', 'My last will and testament')
-      .attach('file', Buffer.from('PDF-LIKE-CONTENT-1234'), { filename: 'will.pdf', contentType: 'application/pdf' });
+      .attach('file', PDF_FIXTURE, { filename: 'will.pdf', contentType: 'application/pdf' });
 
     expect(res.status).toBe(201);
     documentId = res.body.document.id;
@@ -39,7 +47,7 @@ describe('Document upload/download', () => {
     const files = fs.readdirSync(config.uploadsDir);
     expect(files.length).toBeGreaterThan(0);
     const raw = fs.readFileSync(path.join(config.uploadsDir, files[files.length - 1]));
-    expect(raw.includes('PDF-LIKE-CONTENT-1234')).toBe(false);
+    expect(raw.includes(PDF_FIXTURE)).toBe(false);
   });
 
   test('rejects disallowed file types', async () => {
@@ -47,6 +55,14 @@ describe('Document upload/download', () => {
       .post('/api/documents')
       .set('Authorization', `Bearer ${token}`)
       .attach('file', Buffer.from('#!/bin/sh\necho hacked'), { filename: 'evil.sh', contentType: 'application/x-sh' });
+    expect(res.status).toBe(400);
+  });
+
+  test('rejects a declared PDF whose bytes are not actually a PDF', async () => {
+    const res = await request(app)
+      .post('/api/documents')
+      .set('Authorization', `Bearer ${token}`)
+      .attach('file', Buffer.from('not-a-pdf'), { filename: 'fake.pdf', contentType: 'application/pdf' });
     expect(res.status).toBe(400);
   });
 
@@ -61,7 +77,7 @@ describe('Document upload/download', () => {
         response.on('end', () => callback(null, Buffer.concat(chunks)));
       });
     expect(res.status).toBe(200);
-    expect(Buffer.compare(res.body, Buffer.from('PDF-LIKE-CONTENT-1234'))).toBe(0);
+    expect(Buffer.compare(res.body, PDF_FIXTURE)).toBe(0);
   });
 
   test('another user cannot download someone else\'s document', async () => {
