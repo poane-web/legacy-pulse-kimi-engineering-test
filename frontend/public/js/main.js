@@ -84,7 +84,7 @@ async function bootstrap() {
   // cookie from a previous session, this restores their session without
   // requiring them to log in again.
   try {
-    const res = await fetch('/api/auth/refresh', { method: 'POST', credentials: 'include' });
+    const res = await fetch('/api/auth/refresh', { method: 'POST', credentials: 'include', headers: { 'X-Legacy-Pulse-Client': '1' } });
     if (res.ok) {
       const data = await res.json();
       setAccessToken(data.accessToken);

@@ -27,7 +27,7 @@ export function setUnauthorizedHandler(fn) {
 let refreshPromise = null;
 async function refreshAccessToken() {
   if (!refreshPromise) {
-    refreshPromise = fetch(`${API_BASE}/auth/refresh`, { method: 'POST', credentials: 'include' })
+    refreshPromise = fetch(`${API_BASE}/auth/refresh`, { method: 'POST', credentials: 'include', headers: { 'X-Legacy-Pulse-Client': '1' } })
       .then(async (res) => {
         if (!res.ok) throw new Error('refresh_failed');
         const data = await res.json();
@@ -55,6 +55,12 @@ export async function apiRequest(path, opts = {}) {
     const headers = {};
     if (!formData) headers['Content-Type'] = 'application/json';
     if (token) headers['Authorization'] = `Bearer ${token}`;
+    // Required by the backend's CSRF defense-in-depth on cookie-authenticated
+    // auth endpoints (see backend/src/middleware/csrfHeader.js) — a
+    // cross-site <form> submission cannot set custom headers, so this
+    // proves the request came from our own JavaScript. Harmless to send on
+    // every request, not just /auth/*.
+    headers['X-Legacy-Pulse-Client'] = '1';
 
     return fetch(`${API_BASE}${path}`, {
       method,
