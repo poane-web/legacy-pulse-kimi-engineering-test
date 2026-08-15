@@ -94,6 +94,11 @@ router.put(
     // security default (e.g. in case the password change is a response to
     // a suspected compromise).
     db.prepare('UPDATE refresh_tokens SET revoked_at = strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE user_id = ? AND revoked_at IS NULL').run(req.user.id);
+    // V2.0-B (H1): also bump token_version so any access token issued
+    // before this change — which the refresh-token revocation above does
+    // NOT invalidate, since access tokens are otherwise stateless — is
+    // rejected on its very next use, not just at its natural ≤15min expiry.
+    db.prepare('UPDATE users SET token_version = token_version + 1 WHERE id = ?').run(req.user.id);
 
     logAudit({ actorUserId: req.user.id, action: 'auth.password_changed', ip: req.ip });
     res.json({ message: 'Password updated. Please log in again on other devices.' });

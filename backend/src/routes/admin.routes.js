@@ -66,6 +66,12 @@ router.put(
     if (req.body.status === 'disabled') {
       db.prepare("UPDATE refresh_tokens SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ? AND revoked_at IS NULL")
         .run(req.params.id);
+      // V2.0-B (H1): also bump token_version — requireAuth checks this on
+      // every request, so a disabled user's already-issued access tokens
+      // stop working immediately instead of remaining valid until their
+      // natural ≤15min expiry (which was previously the case: only refresh
+      // tokens were revoked here).
+      db.prepare('UPDATE users SET token_version = token_version + 1 WHERE id = ?').run(req.params.id);
     }
 
     logAudit({ actorUserId: req.user.id, action: 'admin.user_status_changed', targetType: 'user', targetId: Number(req.params.id), ip: req.ip, metadata: { status: req.body.status } });

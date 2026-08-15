@@ -12,6 +12,12 @@ CREATE TABLE IF NOT EXISTS users (
   mfa_enabled INTEGER NOT NULL DEFAULT 0,
   mfa_secret_encrypted TEXT,
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+  -- V2 (see docs/V2_SECURITY_AUDIT.md H1): incremented whenever all
+  -- previously-issued access tokens must be invalidated immediately
+  -- (password change, admin disable, "sign out everywhere"), since JWT
+  -- access tokens are otherwise stateless and can't be revoked before
+  -- their natural expiry. Checked on every request in middleware/auth.js.
+  token_version INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );

@@ -10,6 +10,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { handleValidation } = require('../middleware/validate');
 const { authLimiter } = require('../middleware/rateLimit');
 const { requireAuth } = require('../middleware/auth');
+const { requireCsrfHeader } = require('../middleware/csrfHeader');
 const { signAccessToken } = require('../utils/jwt');
 const { sha256Hex, randomToken } = require('../utils/crypto');
 const { logAudit } = require('../utils/audit');
@@ -57,6 +58,7 @@ function revokeRefreshTokenRow(id) {
 // ---- Register --------------------------------------------------------
 router.post(
   '/register',
+  requireCsrfHeader,
   authLimiter,
   [
     body('email').isEmail().withMessage('must be a valid email').normalizeEmail(),
@@ -84,7 +86,7 @@ router.post(
 
     logAudit({ actorUserId: info.lastInsertRowid, action: 'auth.register', ip: req.ip });
 
-    const user = { id: info.lastInsertRowid, email, role: 'owner' };
+    const user = { id: info.lastInsertRowid, email, role: 'owner', tokenVersion: 0 };
     const accessToken = signAccessToken(user);
     const refreshToken = issueRefreshToken(user.id);
     res.cookie(REFRESH_COOKIE_NAME, refreshToken, refreshCookieOptions());
@@ -99,6 +101,7 @@ router.post(
 // ---- Login -------------------------------------------------------------
 router.post(
   '/login',
+  requireCsrfHeader,
   authLimiter,
   [
     body('email').isEmail().withMessage('must be a valid email').normalizeEmail(),
@@ -126,7 +129,7 @@ router.post(
 
     logAudit({ actorUserId: user.id, action: 'auth.login_success', ip: req.ip });
 
-    const accessToken = signAccessToken(user);
+    const accessToken = signAccessToken({ id: user.id, role: user.role, email: user.email, tokenVersion: user.token_version });
     const refreshToken = issueRefreshToken(user.id);
     res.cookie(REFRESH_COOKIE_NAME, refreshToken, refreshCookieOptions());
 
@@ -140,6 +143,7 @@ router.post(
 // ---- Refresh -------------------------------------------------------------
 router.post(
   '/refresh',
+  requireCsrfHeader,
   asyncHandler(async (req, res) => {
     const rawToken = req.cookies && req.cookies[REFRESH_COOKIE_NAME];
     if (!rawToken) throw new UnauthorizedError('No refresh token provided');
@@ -156,7 +160,7 @@ router.post(
     const newRefreshToken = issueRefreshToken(user.id);
     res.cookie(REFRESH_COOKIE_NAME, newRefreshToken, refreshCookieOptions());
 
-    const accessToken = signAccessToken(user);
+    const accessToken = signAccessToken({ id: user.id, role: user.role, email: user.email, tokenVersion: user.token_version });
     res.json({ accessToken });
   })
 );
@@ -164,6 +168,7 @@ router.post(
 // ---- Logout -------------------------------------------------------------
 router.post(
   '/logout',
+  requireCsrfHeader,
   asyncHandler(async (req, res) => {
     const rawToken = req.cookies && req.cookies[REFRESH_COOKIE_NAME];
     if (rawToken) {
