@@ -2,25 +2,27 @@
 
 const { verifyAccessToken } = require('../utils/jwt');
 const { UnauthorizedError } = require('../utils/errors');
+const db = require('../db');
 
 /**
- * Verifies the Bearer access token and attaches { id, role, email } to
- * req.user. Does NOT hit the database on every request (stateless JWT) —
- * that's the point of the access/refresh split described in
- * docs/ARCHITECTURE.md. Revocation is handled at refresh time, not here.
+ * Verifies the bearer token and re-checks the account in the database.
+ * Disabling an account or changing its password therefore invalidates an
+ * already-issued access token immediately instead of waiting for its TTL.
+ * Role/email are read from current DB state rather than trusted from a
+ * potentially stale JWT claim.
  */
 function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const [scheme, token] = header.split(' ');
-  if (scheme !== 'Bearer' || !token) {
-    return next(new UnauthorizedError('Missing or malformed Authorization header'));
-  }
+  if (scheme !== 'Bearer' || !token) return next(new UnauthorizedError('Missing or malformed Authorization header'));
   try {
     const payload = verifyAccessToken(token);
-    req.user = { id: payload.sub, role: payload.role, email: payload.email };
+    const user = db.prepare('SELECT id, email, role, status FROM users WHERE id = ?').get(payload.sub);
+    if (!user || user.status !== 'active') throw new Error('account_unavailable');
+    req.user = { id: user.id, role: user.role, email: user.email };
     return next();
   } catch (err) {
-    return next(new UnauthorizedError('Invalid or expired access token'));
+    return next(new UnauthorizedError('Invalid, expired, or revoked access token'));
   }
 }
 
