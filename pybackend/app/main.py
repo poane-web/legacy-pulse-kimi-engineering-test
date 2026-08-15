@@ -26,7 +26,7 @@ from app.core.security import (
 from app.models.models import (
     User, Profile, FamilyMember, Memory, MediaAsset, LifeEvent, LegacyMessage,
     Notification, AuditLog, RefreshToken, Role, AccessLevel, MediaType,
-    ReleaseCondition, LifeEventCategory
+    ReleaseCondition, LifeEventCategory, ReleaseState, FamilyMember
 )
 from app.models.schemas import (
     RegisterRequest, LoginRequest, TokenResponse, RefreshRequest,
@@ -36,6 +36,12 @@ from app.models.schemas import (
     MediaResponse, NotificationResponse, AuditLogResponse, MessageResponse
 )
 from app.services.audit import log_action
+from app.services.rate_limit import is_rate_limited, record_attempt, clear_attempts
+from app.services.release_engine import (
+    owner_request_release, finalize_release, cancel_release,
+    trusted_confirm_and_maybe_release, ReleaseError,
+)
+from app.models.models import ReleaseState, ConfirmationType
 
 settings = get_settings()
 security = HTTPBearer(auto_error=False)
@@ -50,10 +56,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS + ["*"] if settings.DEBUG else settings.CORS_ORIGINS,
+    allow_origins=settings.cors_origin_list(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # Ensure upload dir exists
@@ -167,7 +173,9 @@ def _seed_demo_data(db: Session):
         body_iv=iv3,
         recipient_id=spouse.id,
         release_condition=ReleaseCondition.MANUAL,
+        release_state=ReleaseState.ACTIVE,
         is_released=False,
+        encryption_version=1,
     )
     db.add(lm)
 
@@ -244,11 +252,17 @@ def register(body: RegisterRequest, request: Request, db: Session = Depends(get_
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    ip, ua = get_client_info(request)
+    rate_key = f"{body.email.lower()}|{ip or 'unknown'}"
+    if is_rate_limited(rate_key, settings.RATE_LIMIT_LOGIN_ATTEMPTS, settings.RATE_LIMIT_LOGIN_WINDOW_SECONDS):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again later.")
     user = db.query(User).filter(User.email == body.email.lower()).first()
     if not user or not verify_password(body.password, user.password_hash):
+        record_attempt(rate_key)
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is deactivated")
+    clear_attempts(rate_key)
 
     user.last_login_at = datetime.utcnow()
     access = create_access_token(user.id, user.role.value, user.email)
@@ -447,7 +461,11 @@ def list_memories(user: User = Depends(get_current_user), db: Session = Depends(
     for m in memories:
         content = None
         try:
-            content = decrypt_text(m.content_encrypted, m.content_iv)
+            if getattr(m, "encryption_version", 1) >= 2 and m.content_encrypted.startswith("{"):
+                from app.core.crypto import decrypt_user_text
+                content = decrypt_user_text(m.content_encrypted, m.owner_id)
+            else:
+                content = decrypt_text(m.content_encrypted, m.content_iv or "")
         except Exception:
             content = "[decryption error]"
         tags = json.loads(m.tags or "[]")
@@ -466,13 +484,15 @@ def create_memory(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    ct, iv, _ = encrypt_text(body.content)
+    from app.core.crypto import encrypt_user_text
+    stored = encrypt_user_text(body.content, user.id)
     mem = Memory(
         id=str(uuid.uuid4()),
         owner_id=user.id,
         title=body.title,
-        content_encrypted=ct,
-        content_iv=iv,
+        content_encrypted=stored,
+        content_iv=None,
+        encryption_version=2,
         memory_date=body.memory_date,
         location=body.location,
         is_private=body.is_private,
@@ -566,7 +586,11 @@ def list_legacy_messages(user: User = Depends(get_current_user), db: Session = D
         body = None
         # Owner always sees content
         try:
-            body = decrypt_text(m.body_encrypted, m.body_iv)
+            if getattr(m, "encryption_version", 1) >= 2 and m.body_encrypted.startswith("{"):
+                from app.core.crypto import decrypt_user_text
+                body = decrypt_user_text(m.body_encrypted, m.owner_id)
+            else:
+                body = decrypt_text(m.body_encrypted, m.body_iv or "")
         except Exception:
             body = "[decryption error]"
         result.append(LegacyMessageResponse(
@@ -584,13 +608,16 @@ def create_legacy_message(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    ct, iv, _ = encrypt_text(body.body)
+    from app.core.crypto import encrypt_user_text
+    stored = encrypt_user_text(body.body, user.id)
     msg = LegacyMessage(
         id=str(uuid.uuid4()),
         owner_id=user.id,
         title=body.title,
-        body_encrypted=ct,
-        body_iv=iv,
+        body_encrypted=stored,
+        body_iv=None,
+        encryption_version=2,
+        release_state=ReleaseState.ACTIVE,
         recipient_id=body.recipient_id,
         release_condition=body.release_condition,
         scheduled_release_at=body.scheduled_release_at,
@@ -614,33 +641,100 @@ def release_legacy_message(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    """
+    V2: Owner-initiated controlled release through the state machine.
+    Does not allow arbitrary admins or broken trusted-contact checks to flip is_released.
+    """
     msg = db.query(LegacyMessage).filter(LegacyMessage.id == msg_id).first()
     if not msg:
         raise HTTPException(status_code=404, detail="Not found")
-    # Owner or trusted contact of owner can release
-    if msg.owner_id != user.id:
-        # Check if current user is a trusted contact of the owner
-        trusted = db.query(FamilyMember).filter(
-            FamilyMember.owner_id == msg.owner_id,
-            FamilyMember.is_trusted_contact == True,
-            # In a full system we would link related_user_id; for MVP owner only for simplicity
-        ).first()
-        if user.role != Role.ADMIN:
-            raise HTTPException(status_code=403, detail="Not authorized to release")
-    if msg.is_released:
-        raise HTTPException(status_code=400, detail="Already released")
-    msg.is_released = True
-    msg.released_at = datetime.utcnow()
-    db.commit()
     ip, ua = get_client_info(request)
-    log_action(db, "LEGACY_MESSAGE_RELEASE", actor_id=user.id, resource_type="LegacyMessage",
-               resource_id=msg_id, ip_address=ip, user_agent=ua)
-    body = decrypt_text(msg.body_encrypted, msg.body_iv)
+    try:
+        if msg.owner_id == user.id:
+            owner_request_release(db, msg, user, ip, ua)
+        elif user.role == Role.ADMIN:
+            # Admin may only finalize an already PENDING release, not start from ACTIVE
+            from app.services.release_engine import finalize_release
+            finalize_release(db, msg, user, ip, ua)
+        else:
+            raise HTTPException(status_code=403, detail="Not authorized to release")
+        db.commit()
+        db.refresh(msg)
+    except ReleaseError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail={"code": e.code, "message": e.message})
+    body = None
+    try:
+        if msg.encryption_version >= 2 and msg.body_encrypted.startswith("{"):
+            from app.core.crypto import decrypt_user_text
+            body = decrypt_user_text(msg.body_encrypted, msg.owner_id)
+        else:
+            body = decrypt_text(msg.body_encrypted, msg.body_iv or "")
+    except Exception:
+        body = "[decryption error]"
     return LegacyMessageResponse(
         id=msg.id, title=msg.title, body=body, recipient_id=msg.recipient_id,
         release_condition=msg.release_condition, scheduled_release_at=msg.scheduled_release_at,
-        is_released=True, released_at=msg.released_at, created_at=msg.created_at,
+        is_released=msg.is_released, released_at=msg.released_at, created_at=msg.created_at,
     )
+
+
+@app.post("/api/legacy-messages/{msg_id}/cancel")
+def cancel_legacy_release(
+    msg_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    msg = db.query(LegacyMessage).filter(LegacyMessage.id == msg_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Not found")
+    ip, ua = get_client_info(request)
+    try:
+        cancel_release(db, msg, user, reason="user_cancel", ip=ip, ua=ua)
+        db.commit()
+    except ReleaseError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail={"code": e.code, "message": e.message})
+    return {"message": "Release cancelled", "state": msg.release_state.value if hasattr(msg.release_state, "value") else msg.release_state}
+
+
+@app.post("/api/legacy-messages/{msg_id}/confirm")
+def confirm_release(
+    msg_id: str,
+    trusted_contact_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Trusted contact confirmation. Requires the contact to belong to the message owner."""
+    msg = db.query(LegacyMessage).filter(LegacyMessage.id == msg_id).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Not found")
+    contact = db.query(FamilyMember).filter(
+        FamilyMember.id == trusted_contact_id,
+        FamilyMember.owner_id == msg.owner_id,
+        FamilyMember.is_trusted_contact == True,
+    ).first()
+    if not contact:
+        raise HTTPException(status_code=403, detail="Invalid trusted contact")
+    # Only the linked related_user or the owner may submit on behalf of the contact for MVP
+    if contact.related_user_id and contact.related_user_id != user.id and msg.owner_id != user.id and user.role != Role.ADMIN:
+        raise HTTPException(status_code=403, detail="Not authorized to confirm for this contact")
+    ip, ua = get_client_info(request)
+    try:
+        msg, conf = trusted_confirm_and_maybe_release(db, msg, contact, user.id, ip, ua)
+        db.commit()
+    except ReleaseError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail={"code": e.code, "message": e.message})
+    return {
+        "message": "Confirmation recorded",
+        "confirmation_id": conf.id,
+        "state": msg.release_state.value if hasattr(msg.release_state, "value") else str(msg.release_state),
+        "is_released": msg.is_released,
+    }
+
 
 
 # ---------- Media Upload ----------

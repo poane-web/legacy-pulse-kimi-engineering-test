@@ -1,9 +1,17 @@
-"""Basic automated tests for authentication and encryption."""
+"""Basic automated tests for authentication and encryption (V1 compat + V2)."""
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-key-must-be-at-least-32-chars")
+os.environ.setdefault(
+    "MASTER_KEY_HEX",
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.core.security import hash_password, verify_password, encrypt_text, decrypt_text, create_access_token, decode_access_token
+from app.core.security import hash_password, verify_password, create_access_token, decode_access_token, encrypt_text, decrypt_text
 
 
 def test_password_hashing():
