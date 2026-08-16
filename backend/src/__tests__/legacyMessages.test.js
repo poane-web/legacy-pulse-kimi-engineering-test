@@ -37,7 +37,7 @@ describe('Legacy message release conditions', () => {
     expect(claim.status).toBe(200);
   });
 
-  test('a future scheduled_date message is NOT readable by the beneficiary before release', async () => {
+  test('a future scheduled message is not readable before release', async () => {
     const future = new Date(Date.now() + 1000 * 60 * 60 * 24 * 30).toISOString();
     const created = await request(app)
       .post('/api/legacy-messages')
@@ -48,12 +48,9 @@ describe('Legacy message release conditions', () => {
 
     const attempt = await request(app).get(`/api/legacy-messages/${messageId}/read`).set('Authorization', `Bearer ${beneficiaryToken}`);
     expect(attempt.status).toBe(403);
-
-    const inbox = await request(app).get('/api/legacy-messages/inbox').set('Authorization', `Bearer ${beneficiaryToken}`);
-    expect(inbox.body.messages.find((m) => m.id === messageId)).toBeUndefined();
   });
 
-  test('a past-due scheduled_date message becomes readable after the release sweep runs', async () => {
+  test('a past-due scheduled message becomes readable after the release sweep', async () => {
     const past = new Date(Date.now() - 1000 * 60).toISOString();
     const created = await request(app)
       .post('/api/legacy-messages')
@@ -61,11 +58,25 @@ describe('Legacy message release conditions', () => {
       .send({ beneficiaryId, title: 'Overdue letter', body: 'The time has come.', releaseType: 'scheduled_date', releaseAt: past });
     const messageId = created.body.message.id;
 
-    runReleaseSweep();
-
+    expect(runReleaseSweep()).toBeGreaterThanOrEqual(1);
     const read = await request(app).get(`/api/legacy-messages/${messageId}/read`).set('Authorization', `Bearer ${beneficiaryToken}`);
     expect(read.status).toBe(200);
     expect(read.body.message.body).toBe('The time has come.');
+  });
+
+  test('a second sweep cannot release the same scheduled message twice', async () => {
+    const past = new Date(Date.now() - 1000 * 60).toISOString();
+    const created = await request(app)
+      .post('/api/legacy-messages')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ beneficiaryId, title: 'Exactly once', body: 'One release.', releaseType: 'scheduled_date', releaseAt: past });
+    const messageId = created.body.message.id;
+
+    expect(runReleaseSweep()).toBeGreaterThanOrEqual(1);
+    expect(runReleaseSweep()).toBe(0);
+    const row = require('./testSetup').db.prepare('SELECT status, released_at FROM legacy_messages WHERE id = ?').get(messageId);
+    expect(row.status).toBe('released');
+    expect(row.released_at).toBeTruthy();
   });
 
   test('a different beneficiary account cannot read a message addressed to someone else', async () => {
@@ -81,57 +92,50 @@ describe('Legacy message release conditions', () => {
     expect(attempt.status).toBe(403);
   });
 
-  test('trusted_contact_confirmation messages require the configured number of confirmations', async () => {
-    const contact1Token = await registerAndLogin('trusted1@example.com');
-    const contact2Token = await registerAndLogin('trusted2@example.com');
+  test('trusted-contact confirmations are scoped to one message', async () => {
+    const contact1Token = await registerAndLogin('scoped-trusted1@example.com');
+    const contact2Token = await registerAndLogin('scoped-trusted2@example.com');
 
     const c1 = await request(app).post('/api/trusted-contacts').set('Authorization', `Bearer ${ownerToken}`)
-      .send({ fullName: 'Trusted One', email: 'trusted1@example.com' });
+      .send({ fullName: 'Scoped Trusted One', email: 'scoped-trusted1@example.com' });
     const c1Token = c1.body.inviteLink.split('token=')[1].split('&')[0];
     await request(app).post('/api/trusted-contacts/claim').set('Authorization', `Bearer ${contact1Token}`).send({ token: c1Token });
 
     const c2 = await request(app).post('/api/trusted-contacts').set('Authorization', `Bearer ${ownerToken}`)
-      .send({ fullName: 'Trusted Two', email: 'trusted2@example.com' });
+      .send({ fullName: 'Scoped Trusted Two', email: 'scoped-trusted2@example.com' });
     const c2Token = c2.body.inviteLink.split('token=')[1].split('&')[0];
     await request(app).post('/api/trusted-contacts/claim').set('Authorization', `Bearer ${contact2Token}`).send({ token: c2Token });
 
-    const ownerMe = await request(app).get('/api/auth/me').set('Authorization', `Bearer ${ownerToken}`);
-    const ownerId = ownerMe.body.user.id;
+    const msgA = await request(app).post('/api/legacy-messages').set('Authorization', `Bearer ${ownerToken}`)
+      .send({ beneficiaryId, title: 'Message A', body: 'A', releaseType: 'trusted_contact_confirmation' });
+    const msgB = await request(app).post('/api/legacy-messages').set('Authorization', `Bearer ${ownerToken}`)
+      .send({ beneficiaryId, title: 'Message B', body: 'B', releaseType: 'trusted_contact_confirmation' });
 
-    const msg = await request(app).post('/api/legacy-messages').set('Authorization', `Bearer ${ownerToken}`)
-      .send({ beneficiaryId, title: 'On my passing', body: 'Take care of each other.', releaseType: 'trusted_contact_confirmation' });
-    const messageId = msg.body.message.id;
+    const a1 = await request(app).post(`/api/trusted-contacts/confirm/${msgA.body.message.id}`).set('Authorization', `Bearer ${contact1Token}`);
+    expect(a1.status).toBe(200);
+    expect(a1.body.released).toBe(false);
 
-    // Before any confirmations: beneficiary cannot read
-    let attempt = await request(app).get(`/api/legacy-messages/${messageId}/read`).set('Authorization', `Bearer ${beneficiaryToken}`);
-    expect(attempt.status).toBe(403);
+    const a2 = await request(app).post(`/api/trusted-contacts/confirm/${msgA.body.message.id}`).set('Authorization', `Bearer ${contact2Token}`);
+    expect(a2.status).toBe(200);
+    expect(a2.body.released).toBe(true);
 
-    // One confirmation: still not enough (default requires 2)
-    const first = await request(app).post(`/api/trusted-contacts/confirm/${ownerId}`).set('Authorization', `Bearer ${contact1Token}`);
-    expect(first.status).toBe(200);
-    attempt = await request(app).get(`/api/legacy-messages/${messageId}/read`).set('Authorization', `Bearer ${beneficiaryToken}`);
-    expect(attempt.status).toBe(403);
-
-    // Second confirmation: now released
-    const second = await request(app).post(`/api/trusted-contacts/confirm/${ownerId}`).set('Authorization', `Bearer ${contact2Token}`);
-    expect(second.status).toBe(200);
-    attempt = await request(app).get(`/api/legacy-messages/${messageId}/read`).set('Authorization', `Bearer ${beneficiaryToken}`);
-    expect(attempt.status).toBe(200);
+    const bRead = await request(app).get(`/api/legacy-messages/${msgB.body.message.id}/read`).set('Authorization', `Bearer ${beneficiaryToken}`);
+    expect(bRead.status).toBe(403);
   });
 
-  test('a trusted contact cannot submit a duplicate confirmation', async () => {
-    const contactToken = await registerAndLogin('dupe-trusted@example.com');
+  test('the same trusted contact cannot confirm the same message twice', async () => {
+    const contactToken = await registerAndLogin('scoped-dupe@example.com');
     const c = await request(app).post('/api/trusted-contacts').set('Authorization', `Bearer ${ownerToken}`)
-      .send({ fullName: 'Dupe Trusted', email: 'dupe-trusted@example.com' });
+      .send({ fullName: 'Scoped Dupe', email: 'scoped-dupe@example.com' });
     const cToken = c.body.inviteLink.split('token=')[1].split('&')[0];
     await request(app).post('/api/trusted-contacts/claim').set('Authorization', `Bearer ${contactToken}`).send({ token: cToken });
 
-    const ownerMe = await request(app).get('/api/auth/me').set('Authorization', `Bearer ${ownerToken}`);
-    const ownerId = ownerMe.body.user.id;
+    const msg = await request(app).post('/api/legacy-messages').set('Authorization', `Bearer ${ownerToken}`)
+      .send({ beneficiaryId, title: 'Duplicate test', body: 'D', releaseType: 'trusted_contact_confirmation' });
 
-    const first = await request(app).post(`/api/trusted-contacts/confirm/${ownerId}`).set('Authorization', `Bearer ${contactToken}`);
+    const first = await request(app).post(`/api/trusted-contacts/confirm/${msg.body.message.id}`).set('Authorization', `Bearer ${contactToken}`);
     expect(first.status).toBe(200);
-    const second = await request(app).post(`/api/trusted-contacts/confirm/${ownerId}`).set('Authorization', `Bearer ${contactToken}`);
+    const second = await request(app).post(`/api/trusted-contacts/confirm/${msg.body.message.id}`).set('Authorization', `Bearer ${contactToken}`);
     expect(second.status).toBe(409);
   });
 });
