@@ -104,6 +104,20 @@ const config = {
   // V2.0-B (M3): seed.js refuses to run against a database started with
   // NODE_ENV=production unless this is explicitly set -- see db/seed.js.
   allowProdSeed: process.env.ALLOW_PROD_SEED === 'true',
+
+  // V2.0-C (docs/V2_0_C_PLAN.md §2): account-level lockout, layered on top
+  // of the existing IP-based rate limiter (auth.routes.js), to slow a
+  // distributed low-and-slow attacker targeting one account from many IPs.
+  accountLockoutThreshold: parseInt(process.env.ACCOUNT_LOCKOUT_THRESHOLD || '5', 10),
+  accountLockoutMinutes: parseInt(process.env.ACCOUNT_LOCKOUT_MINUTES || '15', 10),
+
+  // V2.0-C (docs/V2_0_C_PLAN.md §4): explicit trust-proxy policy. Default
+  // 'false' is the safe choice for this MVP's direct-to-internet,
+  // single-process deployment — Express will not honor X-Forwarded-For at
+  // all, so req.ip is always the true socket peer address, never
+  // spoofable via that header. Only set this if genuinely deployed behind
+  // a reverse proxy/load balancer you control — see .env.example.
+  trustProxy: process.env.TRUST_PROXY || 'false',
 };
 
 module.exports = config;

@@ -7,6 +7,7 @@
   "scripts": {
     "migrate": "node src/db/migrate.js",
     "seed": "node src/db/seed.js",
+    "cleanup": "node src/db/cleanup.js",
     "start": "node src/server.js",
     "dev": "node src/server.js",
     "test": "NODE_ENV=test jest --runInBand"

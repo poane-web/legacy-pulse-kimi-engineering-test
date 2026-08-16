@@ -112,6 +112,15 @@ router.post(
     const { email, password } = req.body;
     const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
 
+    // V2.0-C (docs/V2_0_C_PLAN.md §2, audit finding L4): account-level
+    // lockout on top of the existing IP-based rate limiter. Checked before
+    // the password comparison — an attacker with the correct password but
+    // hitting a locked account still shouldn't get in until it expires.
+    if (user && user.locked_until && new Date(user.locked_until).getTime() > Date.now()) {
+      logAudit({ actorUserId: user.id, action: 'auth.login_blocked_locked', ip: req.ip });
+      throw new UnauthorizedError('This account is temporarily locked due to repeated failed login attempts. Please try again later.');
+    }
+
     // Constant-shape response whether or not the user exists, to avoid
     // leaking account existence via timing/response differences beyond
     // what bcrypt itself already normalizes.
@@ -119,12 +128,27 @@ router.post(
     const passwordMatches = await bcrypt.compare(password, hashToCompare);
 
     if (!user || !passwordMatches) {
+      if (user) {
+        const newCount = user.failed_login_count + 1;
+        if (newCount >= config.accountLockoutThreshold) {
+          const lockedUntil = new Date(Date.now() + config.accountLockoutMinutes * 60 * 1000).toISOString();
+          db.prepare('UPDATE users SET failed_login_count = 0, locked_until = ? WHERE id = ?').run(lockedUntil, user.id);
+          logAudit({ actorUserId: user.id, action: 'auth.account_locked', ip: req.ip, metadata: { threshold: config.accountLockoutThreshold } });
+        } else {
+          db.prepare('UPDATE users SET failed_login_count = ? WHERE id = ?').run(newCount, user.id);
+        }
+      }
       logAudit({ action: 'auth.login_failed', ip: req.ip, metadata: { email } });
       throw new UnauthorizedError('Invalid email or password');
     }
     if (user.status === 'disabled') {
       logAudit({ actorUserId: user.id, action: 'auth.login_blocked_disabled', ip: req.ip });
       throw new UnauthorizedError('This account has been disabled');
+    }
+
+    // Successful login resets the lockout counter.
+    if (user.failed_login_count > 0 || user.locked_until) {
+      db.prepare('UPDATE users SET failed_login_count = 0, locked_until = NULL WHERE id = ?').run(user.id);
     }
 
     logAudit({ actorUserId: user.id, action: 'auth.login_success', ip: req.ip });

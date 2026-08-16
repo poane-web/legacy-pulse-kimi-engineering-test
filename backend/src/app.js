@@ -32,6 +32,15 @@ function createApp() {
   const app = express();
 
   app.disable('x-powered-by');
+  // V2.0-C (docs/V2_0_C_PLAN.md §4, audit finding M5): explicit trust-proxy
+  // policy instead of relying on Express's implicit default. 'false'
+  // (the default here) means X-Forwarded-For is never honored — req.ip is
+  // always the true socket peer, safe for this MVP's direct deployment.
+  // Only change this to a specific proxy count/IP list if this app is
+  // deployed behind a reverse proxy/load balancer you control — see
+  // .env.example for guidance. Blindly trusting it (e.g. 'true') would let
+  // a client spoof its own IP for rate-limiting/audit-log purposes.
+  app.set('trust proxy', config.trustProxy === 'false' ? false : config.trustProxy);
   app.use(helmet());
   app.use(cors({ origin: config.clientOrigin, credentials: true }));
   app.use(express.json({ limit: '1mb' }));
