@@ -18,6 +18,11 @@ CREATE TABLE IF NOT EXISTS users (
   -- access tokens are otherwise stateless and can't be revoked before
   -- their natural expiry. Checked on every request in middleware/auth.js.
   token_version INTEGER NOT NULL DEFAULT 0,
+  -- V2.0-C (docs/V2_0_C_PLAN.md §2, audit finding L4): account-level
+  -- lockout layered on top of the existing IP-based rate limiter, to slow
+  -- a distributed low-and-slow attacker targeting one account from many IPs.
+  failed_login_count INTEGER NOT NULL DEFAULT 0,
+  locked_until TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -90,6 +95,10 @@ CREATE TABLE IF NOT EXISTS documents (
   description_encrypted TEXT,
   file_iv TEXT NOT NULL,
   file_auth_tag TEXT NOT NULL,
+  -- V2.0-C (docs/V2_0_C_PLAN.md §1): 'v1' (legacy, no AAD) or 'v2'
+  -- (AAD-bound to owner). Needed at decrypt time to know whether to pass
+  -- the AAD context to decryptBuffer.
+  enc_format TEXT NOT NULL DEFAULT 'v1',
   checksum_sha256 TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -106,6 +115,7 @@ CREATE TABLE IF NOT EXISTS photos (
   size_bytes INTEGER NOT NULL,
   file_iv TEXT NOT NULL,
   file_auth_tag TEXT NOT NULL,
+  enc_format TEXT NOT NULL DEFAULT 'v1',
   checksum_sha256 TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );

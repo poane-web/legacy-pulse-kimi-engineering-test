@@ -12,6 +12,7 @@ const { requireOwnership } = require('../middleware/rbac');
 const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { encryptField, decryptField } = require('../utils/crypto');
+const { ownerContext } = require('../utils/encryptionContext');
 const storage = require('../services/storage');
 const { contentMatchesDeclaredType } = require('../utils/fileSignature');
 const { BadRequestError } = require('../utils/errors');
@@ -44,10 +45,10 @@ const upload = multer({
 function toDTO(row) {
   return {
     id: row.id,
-    filename: decryptField(row.original_filename_encrypted),
+    filename: decryptField(row.original_filename_encrypted, ownerContext('documents', 'original_filename_encrypted', row.owner_id)),
     mimeType: row.mime_type,
     sizeBytes: row.size_bytes,
-    description: row.description_encrypted ? decryptField(row.description_encrypted) : null,
+    description: row.description_encrypted ? decryptField(row.description_encrypted, ownerContext('documents', 'description_encrypted', row.owner_id)) : null,
     createdAt: row.created_at,
   };
 }
@@ -75,21 +76,23 @@ router.post(
       logAudit({ actorUserId: req.user.id, action: 'document.upload_rejected_signature_mismatch', ip: req.ip, metadata: { declaredMimeType: req.file.mimetype } });
       throw new BadRequestError('File content does not match its declared type');
     }
-    const saved = storage.save(req.file.buffer);
+    const fileContext = ownerContext('documents', 'file', req.user.id);
+    const saved = storage.save(req.file.buffer, fileContext);
 
     const info = db.prepare(
       `INSERT INTO documents
-        (owner_id, original_filename_encrypted, stored_filename, mime_type, size_bytes, description_encrypted, file_iv, file_auth_tag, checksum_sha256)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (owner_id, original_filename_encrypted, stored_filename, mime_type, size_bytes, description_encrypted, file_iv, file_auth_tag, enc_format, checksum_sha256)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       req.user.id,
-      encryptField(req.file.originalname),
+      encryptField(req.file.originalname, ownerContext('documents', 'original_filename_encrypted', req.user.id)),
       saved.storedFilename,
       req.file.mimetype,
       saved.sizeBytes,
-      req.body.description ? encryptField(req.body.description) : null,
+      req.body.description ? encryptField(req.body.description, ownerContext('documents', 'description_encrypted', req.user.id)) : null,
       saved.iv,
       saved.authTag,
+      saved.format,
       saved.checksum
     );
 
@@ -103,10 +106,10 @@ router.get(
   requireOwnership((req) => db.prepare('SELECT * FROM documents WHERE id = ?').get(req.params.id), 'document'),
   asyncHandler(async (req, res) => {
     const row = req.resource;
-    const plaintext = storage.read(row.stored_filename, row.file_iv, row.file_auth_tag, row.checksum_sha256);
+    const plaintext = storage.read(row.stored_filename, row.file_iv, row.file_auth_tag, row.checksum_sha256, row.enc_format, ownerContext('documents', 'file', row.owner_id));
     logAudit({ actorUserId: req.user.id, action: 'document.downloaded', targetType: 'document', targetId: row.id, ip: req.ip });
     res.setHeader('Content-Type', row.mime_type);
-    res.setHeader('Content-Disposition', `attachment; filename="${decryptField(row.original_filename_encrypted).replace(/"/g, '')}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${decryptField(row.original_filename_encrypted, ownerContext('documents', 'original_filename_encrypted', row.owner_id)).replace(/"/g, '')}"`);
     res.send(plaintext);
   })
 );

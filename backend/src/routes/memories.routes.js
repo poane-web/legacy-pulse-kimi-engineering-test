@@ -10,6 +10,7 @@ const { requireOwnership } = require('../middleware/rbac');
 const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { encryptField, decryptField } = require('../utils/crypto');
+const { ownerContext } = require('../utils/encryptionContext');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -21,7 +22,7 @@ function toDTO(row) {
     id: row.id,
     type: row.type,
     title: row.title,
-    content: decryptField(row.content_encrypted),
+    content: decryptField(row.content_encrypted, ownerContext('memories', 'content_encrypted', row.owner_id)),
     tags: row.tags ? row.tags.split(',').filter(Boolean) : [],
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -61,7 +62,7 @@ router.post(
     const { type, title, content, tags } = req.body;
     const info = db.prepare(
       'INSERT INTO memories (owner_id, type, title, content_encrypted, tags) VALUES (?, ?, ?, ?, ?)'
-    ).run(req.user.id, type, title, encryptField(content), Array.isArray(tags) ? tags.join(',') : null);
+    ).run(req.user.id, type, title, encryptField(content, ownerContext('memories', 'content_encrypted', req.user.id)), Array.isArray(tags) ? tags.join(',') : null);
     logAudit({ actorUserId: req.user.id, action: `${type}.created`, targetType: type, targetId: info.lastInsertRowid, ip: req.ip });
     const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(info.lastInsertRowid);
     res.status(201).json({ memory: toDTO(row) });
@@ -86,7 +87,7 @@ router.put(
         tags = COALESCE(?, tags),
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE id = ?`
-    ).run(title ?? null, content !== undefined ? encryptField(content) : null, Array.isArray(tags) ? tags.join(',') : null, req.params.id);
+    ).run(title ?? null, content !== undefined ? encryptField(content, ownerContext('memories', 'content_encrypted', req.user.id)) : null, Array.isArray(tags) ? tags.join(',') : null, req.params.id);
     logAudit({ actorUserId: req.user.id, action: `${req.resource.type}.updated`, targetType: req.resource.type, targetId: Number(req.params.id), ip: req.ip });
     res.json({ memory: toDTO(db.prepare('SELECT * FROM memories WHERE id = ?').get(req.params.id)) });
   })

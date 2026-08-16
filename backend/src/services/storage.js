@@ -21,19 +21,29 @@ if (!fs.existsSync(config.uploadsDir)) fs.mkdirSync(config.uploadsDir, { recursi
  * derived from the user-supplied original filename, which avoids path
  * traversal and avoids leaking content hints via directory listing).
  * Returns metadata to persist in the DB row.
+ *
+ * V2.0-C (docs/V2_0_C_PLAN.md §1): accepts an optional AAD `context`
+ * string, binding the encrypted file to (typically) its owning user, so a
+ * ciphertext blob copied onto another owner's row fails to decrypt. Callers
+ * must persist the returned `format` alongside the other metadata and pass
+ * the SAME context back into `read()`.
  */
-function save(buffer) {
+function save(buffer, context) {
   const storedFilename = crypto.randomUUID();
-  const { ciphertext, iv, authTag } = encryptBuffer(buffer);
+  const { ciphertext, iv, authTag, format } = encryptBuffer(buffer, context);
   const checksum = sha256Hex(buffer);
   fs.writeFileSync(path.join(config.uploadsDir, storedFilename), ciphertext);
-  return { storedFilename, iv, authTag, checksum, sizeBytes: buffer.length };
+  return { storedFilename, iv, authTag, checksum, sizeBytes: buffer.length, format };
 }
 
-/** Reads and decrypts a stored file, verifying against the stored checksum. */
-function read(storedFilename, iv, authTag, expectedChecksum) {
+/**
+ * Reads and decrypts a stored file, verifying against the stored checksum.
+ * @param {string} context - required if the file was saved with `format ===
+ *   'v2'`; must match what was passed to `save()`.
+ */
+function read(storedFilename, iv, authTag, expectedChecksum, format, context) {
   const ciphertext = fs.readFileSync(path.join(config.uploadsDir, storedFilename));
-  const plaintext = decryptBuffer(ciphertext, iv, authTag);
+  const plaintext = decryptBuffer(ciphertext, iv, authTag, format === 'v2' ? context : undefined);
   if (expectedChecksum && sha256Hex(plaintext) !== expectedChecksum) {
     throw new Error('File integrity check failed: checksum mismatch after decryption');
   }

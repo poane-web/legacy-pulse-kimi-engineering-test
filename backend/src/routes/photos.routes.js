@@ -12,6 +12,7 @@ const { requireOwnership } = require('../middleware/rbac');
 const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { encryptField, decryptField } = require('../utils/crypto');
+const { ownerContext } = require('../utils/encryptionContext');
 const storage = require('../services/storage');
 const { contentMatchesDeclaredType } = require('../utils/fileSignature');
 const { BadRequestError } = require('../utils/errors');
@@ -35,7 +36,7 @@ const upload = multer({
 function toDTO(row) {
   return {
     id: row.id,
-    caption: row.caption_encrypted ? decryptField(row.caption_encrypted) : null,
+    caption: row.caption_encrypted ? decryptField(row.caption_encrypted, ownerContext('photos', 'caption_encrypted', row.owner_id)) : null,
     mimeType: row.mime_type,
     sizeBytes: row.size_bytes,
     memoryId: row.memory_id,
@@ -81,21 +82,23 @@ router.post(
       if (!e || e.owner_id !== req.user.id) throw new BadRequestError('Invalid lifeEventId');
     }
 
-    const saved = storage.save(req.file.buffer);
+    const fileContext = ownerContext('photos', 'file', req.user.id);
+    const saved = storage.save(req.file.buffer, fileContext);
     const info = db.prepare(
       `INSERT INTO photos
-        (owner_id, memory_id, life_event_id, caption_encrypted, stored_filename, mime_type, size_bytes, file_iv, file_auth_tag, checksum_sha256)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (owner_id, memory_id, life_event_id, caption_encrypted, stored_filename, mime_type, size_bytes, file_iv, file_auth_tag, enc_format, checksum_sha256)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       req.user.id,
       req.body.memoryId || null,
       req.body.lifeEventId || null,
-      req.body.caption ? encryptField(req.body.caption) : null,
+      req.body.caption ? encryptField(req.body.caption, ownerContext('photos', 'caption_encrypted', req.user.id)) : null,
       saved.storedFilename,
       req.file.mimetype,
       saved.sizeBytes,
       saved.iv,
       saved.authTag,
+      saved.format,
       saved.checksum
     );
 
@@ -109,7 +112,7 @@ router.get(
   requireOwnership((req) => db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id), 'photo'),
   asyncHandler(async (req, res) => {
     const row = req.resource;
-    const plaintext = storage.read(row.stored_filename, row.file_iv, row.file_auth_tag, row.checksum_sha256);
+    const plaintext = storage.read(row.stored_filename, row.file_iv, row.file_auth_tag, row.checksum_sha256, row.enc_format, ownerContext('photos', 'file', row.owner_id));
     // V2.0-B (M4): documents.routes.js already logged successful downloads;
     // photos didn't, leaving an audit-coverage gap for a resource type this
     // product's activity log is supposed to cover.

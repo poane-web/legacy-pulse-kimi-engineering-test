@@ -10,6 +10,7 @@ const { requireOwnership } = require('../middleware/rbac');
 const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { encryptField, decryptField } = require('../utils/crypto');
+const { ownerContext } = require('../utils/encryptionContext');
 const { BadRequestError, ForbiddenError, NotFoundError } = require('../utils/errors');
 
 const router = express.Router();
@@ -20,7 +21,7 @@ function ownerDTO(row) {
     id: row.id,
     beneficiaryId: row.beneficiary_id,
     title: row.title,
-    body: decryptField(row.body_encrypted),
+    body: decryptField(row.body_encrypted, ownerContext('legacy_messages', 'body_encrypted', row.owner_id)),
     releaseType: row.release_type,
     releaseAt: row.release_at,
     requiredConfirmations: row.required_confirmations,
@@ -69,7 +70,7 @@ router.post(
       req.user.id,
       beneficiaryId,
       title,
-      encryptField(msgBody),
+      encryptField(msgBody, ownerContext('legacy_messages', 'body_encrypted', req.user.id)),
       releaseType,
       releaseType === 'scheduled_date' ? releaseAt : null,
       isImmediate ? 'released' : 'pending',
@@ -107,7 +108,7 @@ router.put(
         body_encrypted = COALESCE(?, body_encrypted),
         release_at = COALESCE(?, release_at)
        WHERE id = ?`
-    ).run(title ?? null, msgBody !== undefined ? encryptField(msgBody) : null, releaseAt ?? null, req.params.id);
+    ).run(title ?? null, msgBody !== undefined ? encryptField(msgBody, ownerContext('legacy_messages', 'body_encrypted', req.user.id)) : null, releaseAt ?? null, req.params.id);
     logAudit({ actorUserId: req.user.id, action: 'legacy_message.updated', targetType: 'legacy_message', targetId: Number(req.params.id), ip: req.ip });
     res.json({ message: ownerDTO(db.prepare('SELECT * FROM legacy_messages WHERE id = ?').get(req.params.id)) });
   })
@@ -177,7 +178,7 @@ router.get(
       message: {
         id: row.id,
         title: row.title,
-        body: decryptField(row.body_encrypted),
+        body: decryptField(row.body_encrypted, ownerContext('legacy_messages', 'body_encrypted', row.owner_id)),
         releasedAt: row.released_at,
       },
     });

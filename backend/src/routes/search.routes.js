@@ -20,6 +20,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { requireAuth } = require('../middleware/auth');
 const { handleValidation } = require('../middleware/validate');
 const { decryptField } = require('../utils/crypto');
+const { ownerContext } = require('../utils/encryptionContext');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -34,7 +35,7 @@ router.get(
 
     const memories = db.prepare('SELECT * FROM memories WHERE owner_id = ?').all(req.user.id);
     for (const m of memories) {
-      const content = decryptField(m.content_encrypted);
+      const content = decryptField(m.content_encrypted, ownerContext('memories', 'content_encrypted', m.owner_id));
       if (m.title.toLowerCase().includes(q) || (m.tags || '').toLowerCase().includes(q) || content.toLowerCase().includes(q)) {
         results.push({ type: m.type, id: m.id, title: m.title, snippet: content.slice(0, 160) });
       }
@@ -49,7 +50,7 @@ router.get(
 
     const documents = db.prepare('SELECT * FROM documents WHERE owner_id = ?').all(req.user.id);
     for (const d of documents) {
-      const filename = decryptField(d.original_filename_encrypted);
+      const filename = decryptField(d.original_filename_encrypted, ownerContext('documents', 'original_filename_encrypted', d.owner_id));
       if (filename.toLowerCase().includes(q)) {
         results.push({ type: 'document', id: d.id, title: filename, snippet: d.mime_type });
       }
