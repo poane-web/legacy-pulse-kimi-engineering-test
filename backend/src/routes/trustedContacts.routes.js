@@ -7,6 +7,7 @@ const db = require('../db');
 const asyncHandler = require('../utils/asyncHandler');
 const { requireAuth } = require('../middleware/auth');
 const { requireOwnership } = require('../middleware/rbac');
+const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { sha256Hex, randomToken } = require('../utils/crypto');
 const { NotFoundError, ForbiddenError, ConflictError, BadRequestError } = require('../utils/errors');
