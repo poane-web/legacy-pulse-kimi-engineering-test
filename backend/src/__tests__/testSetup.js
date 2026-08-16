@@ -4,7 +4,6 @@
 // reads process.env at require-time.
 'use strict';
 
-const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
@@ -16,19 +15,19 @@ process.env.UPLOADS_DIR = path.join(os.tmpdir(), `legacy-pulse-test-uploads-${pr
 process.env.JWT_ACCESS_SECRET = 'test-access-secret';
 process.env.JWT_REFRESH_SECRET = 'test-refresh-secret';
 process.env.DATA_ENCRYPTION_KEY = require('crypto').randomBytes(32).toString('base64');
-process.env.BCRYPT_COST = '4'; // fast for tests
+process.env.BCRYPT_COST = '4';
 process.env.CLIENT_ORIGIN = 'http://localhost:5173';
 
-// Apply schema to the fresh test DB.
+// Apply the same forward migrations used by a real deployment. This keeps
+// security tests from silently testing a schema older than production.
+require('../db/migrate');
 const db = require('../db');
-const schema = fs.readFileSync(path.join(__dirname, '..', 'db', 'schema.sql'), 'utf8');
-db.exec(schema);
 
 afterAll(() => {
   db.close();
-  try { fs.unlinkSync(testDbPath); } catch (e) { /* ignore */ }
-  try { fs.unlinkSync(testDbPath + '-wal'); } catch (e) { /* ignore */ }
-  try { fs.unlinkSync(testDbPath + '-shm'); } catch (e) { /* ignore */ }
+  try { require('fs').unlinkSync(testDbPath); } catch (e) { /* ignore */ }
+  try { require('fs').unlinkSync(testDbPath + '-wal'); } catch (e) { /* ignore */ }
+  try { require('fs').unlinkSync(testDbPath + '-shm'); } catch (e) { /* ignore */ }
 });
 
 module.exports = { db };
