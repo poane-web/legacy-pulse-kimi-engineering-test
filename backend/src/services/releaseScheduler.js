@@ -1,7 +1,3 @@
-// Background worker that releases scheduled-date legacy messages once
-// their release_at time has passed. Runs every minute via node-cron.
-// Extracted as a pure function (`runReleaseSweep`) so it's unit-testable
-// without waiting on a real cron tick.
 'use strict';
 
 const cron = require('node-cron');
@@ -11,15 +7,22 @@ const { logAudit } = require('../utils/audit');
 function runReleaseSweep() {
   const now = new Date().toISOString();
   const due = db.prepare(
-    "SELECT * FROM legacy_messages WHERE status = 'pending' AND release_type = 'scheduled_date' AND release_at <= ?"
+    "SELECT id, beneficiary_id, title FROM legacy_messages WHERE status = 'pending' AND release_type = 'scheduled_date' AND release_at <= ?"
   ).all(now);
 
-  const release = db.prepare("UPDATE legacy_messages SET status = 'released', released_at = ? WHERE id = ?");
+  // The status predicate is part of the write, not merely the discovery
+  // query. Two scheduler workers can therefore observe the same due row, but
+  // only one can transition it from pending -> released.
+  const release = db.prepare(
+    "UPDATE legacy_messages SET status = 'released', released_at = ? WHERE id = ? AND status = 'pending' AND release_type = 'scheduled_date' AND release_at <= ?"
+  );
   const notify = db.prepare('INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)');
 
   let released = 0;
   for (const msg of due) {
-    release.run(now, msg.id);
+    const result = release.run(now, msg.id, now);
+    if (result.changes !== 1) continue;
+
     logAudit({ action: 'legacy_message.released', targetType: 'legacy_message', targetId: msg.id, metadata: { trigger: 'scheduled_date' } });
     const beneficiary = db.prepare('SELECT * FROM beneficiaries WHERE id = ?').get(msg.beneficiary_id);
     if (beneficiary && beneficiary.linked_user_id) {
@@ -31,8 +34,8 @@ function runReleaseSweep() {
 }
 
 function startReleaseScheduler() {
-  // Every minute. Idempotent (a message already 'released' won't match the
-  // WHERE clause again), so overlapping runs are harmless.
+  // Every minute. The transition itself is atomic, so overlapping workers do
+  // not duplicate the release or notification.
   return cron.schedule('* * * * *', () => {
     try {
       runReleaseSweep();
