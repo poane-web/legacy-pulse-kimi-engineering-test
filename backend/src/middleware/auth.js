@@ -41,6 +41,15 @@ function requireAuth(req, res, next) {
   }
   try {
     const payload = verifyAccessToken(token);
+    // V2.0-C (docs/V2_0_C_PLAN.md §3): reject anything that isn't a real
+    // access token — specifically, an MFA challenge token issued after
+    // only the first factor (see utils/jwt.js signMfaChallengeToken). A
+    // token with no `typ` claim at all predates this change and is treated
+    // as 'access' for backward compatibility with sessions issued before
+    // this deploy, mirroring the tokenVersion default-to-0 approach.
+    if (payload.typ !== undefined && payload.typ !== 'access') {
+      return next(new UnauthorizedError('Invalid or expired access token'));
+    }
     const current = getUserVersion.get(payload.sub);
     if (!current || current.status === 'disabled') {
       return next(new UnauthorizedError('Account unavailable'));

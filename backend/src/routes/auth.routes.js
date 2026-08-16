@@ -11,8 +11,10 @@ const { handleValidation } = require('../middleware/validate');
 const { authLimiter } = require('../middleware/rateLimit');
 const { requireAuth } = require('../middleware/auth');
 const { requireCsrfHeader } = require('../middleware/csrfHeader');
-const { signAccessToken } = require('../utils/jwt');
-const { sha256Hex, randomToken } = require('../utils/crypto');
+const { signAccessToken, signMfaChallengeToken, verifyMfaChallengeToken } = require('../utils/jwt');
+const { sha256Hex, randomToken, decryptField } = require('../utils/crypto');
+const { ownerContext } = require('../utils/encryptionContext');
+const { verifyTotp } = require('../utils/totp');
 const { logAudit } = require('../utils/audit');
 const { BadRequestError, UnauthorizedError, ConflictError } = require('../utils/errors');
 
@@ -53,6 +55,15 @@ function findValidRefreshToken(rawToken) {
 
 function revokeRefreshTokenRow(id) {
   db.prepare('UPDATE refresh_tokens SET revoked_at = strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE id = ?').run(id);
+}
+
+// V2.0-C (docs/V2_0_C_PLAN.md §3): shared by the normal login path and the
+// post-MFA-verification path, so both issue tokens identically.
+function issueFullSession(res, user) {
+  const accessToken = signAccessToken({ id: user.id, role: user.role, email: user.email, tokenVersion: user.token_version });
+  const refreshToken = issueRefreshToken(user.id);
+  res.cookie(REFRESH_COOKIE_NAME, refreshToken, refreshCookieOptions());
+  return accessToken;
 }
 
 // ---- Register --------------------------------------------------------
@@ -153,9 +164,55 @@ router.post(
 
     logAudit({ actorUserId: user.id, action: 'auth.login_success', ip: req.ip });
 
-    const accessToken = signAccessToken({ id: user.id, role: user.role, email: user.email, tokenVersion: user.token_version });
-    const refreshToken = issueRefreshToken(user.id);
-    res.cookie(REFRESH_COOKIE_NAME, refreshToken, refreshCookieOptions());
+    // V2.0-C (docs/V2_0_C_PLAN.md §3): if MFA is enabled, the first factor
+    // (password) being correct is not enough — issue a short-lived
+    // challenge token instead of real tokens, and require
+    // POST /auth/mfa/verify with a valid TOTP code before any session is
+    // actually created.
+    if (user.mfa_enabled) {
+      const challengeToken = signMfaChallengeToken(user.id);
+      logAudit({ actorUserId: user.id, action: 'auth.mfa_challenge_issued', ip: req.ip });
+      return res.json({ mfaRequired: true, challengeToken });
+    }
+
+    const accessToken = issueFullSession(res, user);
+
+    res.json({
+      accessToken,
+      user: { id: user.id, email: user.email, fullName: user.full_name, role: user.role },
+    });
+  })
+);
+
+// ---- MFA verify (second factor) -----------------------------------------
+router.post(
+  '/mfa/verify',
+  requireCsrfHeader,
+  authLimiter,
+  [body('challengeToken').isString().notEmpty(), body('code').isString().notEmpty()],
+  handleValidation,
+  asyncHandler(async (req, res) => {
+    let payload;
+    try {
+      payload = verifyMfaChallengeToken(req.body.challengeToken);
+    } catch (err) {
+      throw new UnauthorizedError('Invalid or expired MFA challenge. Please log in again.');
+    }
+
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.sub);
+    if (!user || user.status === 'disabled' || !user.mfa_enabled) {
+      throw new UnauthorizedError('MFA verification is not available for this account');
+    }
+
+    const secret = decryptField(user.mfa_secret_encrypted, ownerContext('users', 'mfa_secret_encrypted', user.id));
+    const codeValid = verifyTotp(secret, req.body.code);
+    if (!codeValid) {
+      logAudit({ actorUserId: user.id, action: 'auth.mfa_verify_failed', ip: req.ip });
+      throw new UnauthorizedError('Invalid verification code');
+    }
+
+    logAudit({ actorUserId: user.id, action: 'auth.mfa_verify_success', ip: req.ip });
+    const accessToken = issueFullSession(res, user);
 
     res.json({
       accessToken,
