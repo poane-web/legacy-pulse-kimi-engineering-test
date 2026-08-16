@@ -15,6 +15,13 @@ const { BadRequestError, ForbiddenError, NotFoundError } = require('../utils/err
 const router = express.Router();
 router.use(requireAuth);
 
+function normalizeReleaseAt(value) {
+  if (value === undefined || value === null) return value;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) throw new BadRequestError('releaseAt must be a valid ISO-8601 timestamp');
+  return parsed.toISOString();
+}
+
 function ownerDTO(row) {
   return {
     id: row.id,
@@ -30,7 +37,6 @@ function ownerDTO(row) {
   };
 }
 
-// ---- Owner: list/create/update/delete own authored messages -------------
 router.get(
   '/',
   asyncHandler(async (req, res) => {
@@ -60,6 +66,7 @@ router.post(
       throw new BadRequestError('releaseAt is required when releaseType is scheduled_date');
     }
 
+    const normalizedReleaseAt = releaseType === 'scheduled_date' ? normalizeReleaseAt(releaseAt) : null;
     const isImmediate = releaseType === 'immediate';
     const info = db.prepare(
       `INSERT INTO legacy_messages
@@ -71,7 +78,7 @@ router.post(
       title,
       encryptField(msgBody),
       releaseType,
-      releaseType === 'scheduled_date' ? releaseAt : null,
+      normalizedReleaseAt,
       isImmediate ? 'released' : 'pending',
       isImmediate ? new Date().toISOString() : null
     );
@@ -100,14 +107,34 @@ router.put(
     if (req.resource.status !== 'pending') {
       throw new BadRequestError('Only pending (not yet released) messages can be edited');
     }
+    if (req.body.releaseAt === null && req.resource.release_type === 'scheduled_date') {
+      throw new BadRequestError('Scheduled messages must retain a releaseAt timestamp');
+    }
+
     const { title, body: msgBody, releaseAt } = req.body;
-    db.prepare(
+    const normalizedReleaseAt = releaseAt !== undefined ? normalizeReleaseAt(releaseAt) : undefined;
+
+    // Re-check status in the write. The ownership middleware's read can be
+    // stale: a scheduler or another session may release the message between
+    // the read and this UPDATE. A released message must never be editable.
+    const result = db.prepare(
       `UPDATE legacy_messages SET
         title = COALESCE(?, title),
         body_encrypted = COALESCE(?, body_encrypted),
         release_at = COALESCE(?, release_at)
-       WHERE id = ?`
-    ).run(title ?? null, msgBody !== undefined ? encryptField(msgBody) : null, releaseAt ?? null, req.params.id);
+       WHERE id = ? AND owner_id = ? AND status = 'pending'`
+    ).run(
+      title ?? null,
+      msgBody !== undefined ? encryptField(msgBody) : null,
+      normalizedReleaseAt ?? null,
+      req.params.id,
+      req.user.id
+    );
+
+    if (result.changes !== 1) {
+      throw new BadRequestError('Message was released or changed before this update could be applied');
+    }
+
     logAudit({ actorUserId: req.user.id, action: 'legacy_message.updated', targetType: 'legacy_message', targetId: Number(req.params.id), ip: req.ip });
     res.json({ message: ownerDTO(db.prepare('SELECT * FROM legacy_messages WHERE id = ?').get(req.params.id)) });
   })
@@ -120,13 +147,13 @@ router.delete(
     if (req.resource.status !== 'pending') {
       throw new BadRequestError('Only pending (not yet released) messages can be deleted');
     }
-    db.prepare('DELETE FROM legacy_messages WHERE id = ?').run(req.params.id);
+    const result = db.prepare("DELETE FROM legacy_messages WHERE id = ? AND owner_id = ? AND status = 'pending'").run(req.params.id, req.user.id);
+    if (result.changes !== 1) throw new BadRequestError('Message was released before it could be deleted');
     logAudit({ actorUserId: req.user.id, action: 'legacy_message.deleted', targetType: 'legacy_message', targetId: Number(req.params.id), ip: req.ip });
     res.status(204).end();
   })
 );
 
-// ---- Beneficiary: inbox of released messages addressed to them ----------
 router.get(
   '/inbox',
   asyncHandler(async (req, res) => {
@@ -137,14 +164,7 @@ router.get(
        ORDER BY lm.released_at DESC`
     ).all(req.user.id);
     res.json({
-      messages: rows.map((row) => ({
-        id: row.id,
-        title: row.title,
-        releasedAt: row.released_at,
-        // Body intentionally omitted from the list view; fetched only via
-        // the single-message read endpoint below, which re-checks
-        // authorization and writes an audit entry for the read itself.
-      })),
+      messages: rows.map((row) => ({ id: row.id, title: row.title, releasedAt: row.released_at })),
     });
   })
 );
@@ -167,8 +187,6 @@ router.get(
         ip: req.ip,
         metadata: { reason: !isAddressedToCaller ? 'not_addressed_to_caller' : 'not_yet_released' },
       });
-      // Same response for "not yours" and "not released yet" — avoids
-      // confirming existence/ownership details to a probing caller.
       throw new ForbiddenError('This message is not available to you');
     }
 
