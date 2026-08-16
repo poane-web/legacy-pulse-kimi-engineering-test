@@ -38,8 +38,9 @@ from app.models.schemas import (
 )
 from app.services.audit import log_action
 from app.utils.files import validate_upload, content_disposition_attachment, FileValidationError
+from app.services.media_guard import assert_memory_owned_by, MediaAuthError
 from app.core.step_up import (
-    StepUpRequest, StepUpTokenResponse, create_step_up_token, verify_step_up_token,
+    StepUpRequest, StepUpTokenResponse, create_step_up_token, verify_step_up_token, consume_step_up_token,
     SCOPE_RELEASE_FINALIZE, SCOPE_BENEFICIARY_CHANGE, SCOPE_TRUSTED_CONTACT_CHANGE,
     SCOPE_PASSWORD_CHANGE, SCOPE_SENSITIVE,
 )
@@ -475,6 +476,7 @@ def create_family(
                     "scope": scope,
                 },
             )
+        consume_step_up_token(step_token)
     notes_enc, notes_iv = None, None
     if body.notes:
         notes_enc, notes_iv, _ = encrypt_text(body.notes)
@@ -731,6 +733,7 @@ def release_legacy_message(
                     },
                 )
             owner_request_release(db, msg, user, ip, ua)
+            consume_step_up_token(step_token)
         elif user.role == Role.ADMIN:
             # Admin may only finalize an already PENDING release, not start from ACTIVE
             from app.services.release_engine import finalize_release
@@ -797,9 +800,14 @@ def confirm_release(
     ).first()
     if not contact:
         raise HTTPException(status_code=403, detail="Invalid trusted contact")
-    # Only the linked related_user or the owner may submit on behalf of the contact for MVP
-    if contact.related_user_id and contact.related_user_id != user.id and msg.owner_id != user.id and user.role != Role.ADMIN:
+    # Owner may never confirm as trusted contact
+    if user.id == msg.owner_id:
+        raise HTTPException(status_code=403, detail="Owner cannot confirm as trusted contact")
+    # Only the linked related_user may confirm
+    if contact.related_user_id and contact.related_user_id != user.id and user.role != Role.ADMIN:
         raise HTTPException(status_code=403, detail="Not authorized to confirm for this contact")
+    if not contact.related_user_id and user.role != Role.ADMIN:
+        raise HTTPException(status_code=403, detail="Trusted contact has no linked user identity")
     ip, ua = get_client_info(request)
     try:
         msg, conf = trusted_confirm_and_maybe_release(db, msg, contact, user.id, ip, ua)
@@ -836,6 +844,11 @@ async def upload_media(
         )
     except FileValidationError as e:
         raise HTTPException(status_code=400, detail={"code": e.code, "message": e.message})
+    if memory_id:
+        try:
+            assert_memory_owned_by(db, memory_id, user.id)
+        except MediaAuthError as e:
+            raise HTTPException(status_code=403, detail=e.message)
 
     media_type = MediaType.PHOTO if meta["media_type"] == "PHOTO" else MediaType.DOCUMENT
     ciphertext, iv = encrypt_file(content)

@@ -100,3 +100,25 @@ def verify_audit_chain(db: Session, limit: int = 1000) -> tuple[bool, str]:
             return False, f"hash mismatch at {row.id}"
         expected_prev = row.entry_hash
     return True, f"ok ({len(rows)} entries)"
+
+
+def assert_audit_immutable(db: Session, entry_id: str) -> None:
+    """
+    Recompute hash for an entry; raise if stored hash does not match
+    (detects UPDATE tampering of audited fields).
+    """
+    entry = db.query(AuditLog).filter(AuditLog.id == entry_id).first()
+    if not entry:
+        raise ValueError("Audit entry not found")
+    recomputed = _compute_entry_hash(
+        entry.id,
+        entry.actor_id,
+        entry.action,
+        entry.resource_type,
+        entry.resource_id,
+        entry.metadata_json,
+        entry.created_at,
+        entry.prev_hash,
+    )
+    if recomputed != entry.entry_hash:
+        raise ValueError(f"Audit integrity failure at {entry_id}")

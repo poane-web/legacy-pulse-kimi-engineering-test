@@ -48,6 +48,10 @@ def create_step_up_token(user_id: str, scope: str) -> str:
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
+
+_consumed_jtis: set[str] = set()
+
+
 def verify_step_up_token(token: str, user_id: str, required_scope: str) -> bool:
     settings = get_settings()
     try:
@@ -61,13 +65,32 @@ def verify_step_up_token(token: str, user_id: str, required_scope: str) -> bool:
             return False
         if payload.get("sub") != user_id:
             return False
+        jti = payload.get("jti")
+        if jti and jti in _consumed_jtis:
+            return False
         scope = payload.get("scope") or ""
-        # Exact match or wildcard "sensitive"
         if scope != required_scope and scope != "sensitive":
             return False
         return True
     except JWTError:
         return False
+
+
+def consume_step_up_token(token: str) -> None:
+    """Mark step-up token jti as consumed (single-use)."""
+    settings = get_settings()
+    try:
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+            options={"require_exp": True, "require_sub": True},
+        )
+        jti = payload.get("jti")
+        if jti:
+            _consumed_jtis.add(jti)
+    except JWTError:
+        pass
 
 
 # Scopes used by the application
