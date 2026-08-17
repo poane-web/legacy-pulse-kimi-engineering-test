@@ -71,9 +71,10 @@ Standard error shape:
 ## Photos
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | /photos | bearer(owner) | List metadata |
-| POST | /photos | bearer(owner), multipart | Upload (image types only) |
+| GET | /photos | bearer(owner) | List metadata. Optional `?memoryId=` or `?lifeEventId=` scopes to photos attached to that resource (V2.0-E) |
+| POST | /photos | bearer(owner), multipart | Upload (image types only). `memoryId`/`lifeEventId` are mutually exclusive (V2.0-E) |
 | GET | /photos/:id/download | bearer(owner), ownership | Decrypts and streams |
+| PUT | /photos/:id/attachment | bearer(owner), ownership | Move a photo between memory/life-event/no attachment (V2.0-E) |
 | DELETE | /photos/:id | bearer(owner), ownership | Delete |
 
 ## Legacy Messages

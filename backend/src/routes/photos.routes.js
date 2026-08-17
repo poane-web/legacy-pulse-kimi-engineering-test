@@ -2,7 +2,7 @@
 
 const express = require('express');
 const multer = require('multer');
-const { body } = require('express-validator');
+const { body, query } = require('express-validator');
 
 const db = require('../db');
 const config = require('../config/env');
@@ -47,8 +47,27 @@ function toDTO(row) {
 
 router.get(
   '/',
+  [
+    query('memoryId').optional().isInt(),
+    query('lifeEventId').optional().isInt(),
+  ],
+  handleValidation,
   asyncHandler(async (req, res) => {
-    const rows = db.prepare('SELECT * FROM photos WHERE owner_id = ? ORDER BY created_at DESC').all(req.user.id);
+    // V2.0-E (docs/V2_0_E_PLAN.md §2): scoped filtering so a client can
+    // ask "photos for this memory" / "photos for this life event"
+    // directly, instead of fetching every photo and filtering client-side.
+    let rows;
+    if (req.query.memoryId) {
+      const m = db.prepare('SELECT owner_id FROM memories WHERE id = ?').get(req.query.memoryId);
+      if (!m || m.owner_id !== req.user.id) throw new BadRequestError('Invalid memoryId');
+      rows = db.prepare('SELECT * FROM photos WHERE owner_id = ? AND memory_id = ? ORDER BY created_at DESC').all(req.user.id, req.query.memoryId);
+    } else if (req.query.lifeEventId) {
+      const e = db.prepare('SELECT owner_id FROM life_events WHERE id = ?').get(req.query.lifeEventId);
+      if (!e || e.owner_id !== req.user.id) throw new BadRequestError('Invalid lifeEventId');
+      rows = db.prepare('SELECT * FROM photos WHERE owner_id = ? AND life_event_id = ? ORDER BY created_at DESC').all(req.user.id, req.query.lifeEventId);
+    } else {
+      rows = db.prepare('SELECT * FROM photos WHERE owner_id = ? ORDER BY created_at DESC').all(req.user.id);
+    }
     res.json({ photos: rows.map(toDTO) });
   })
 );
@@ -69,6 +88,16 @@ router.post(
     if (!contentMatchesDeclaredType(req.file.buffer, req.file.mimetype)) {
       logAudit({ actorUserId: req.user.id, action: 'photo.upload_rejected_signature_mismatch', ip: req.ip, metadata: { declaredMimeType: req.file.mimetype } });
       throw new BadRequestError('File content does not match its declared type');
+    }
+
+    // V2.0-E (docs/V2_0_E_PLAN.md §1): a photo may illustrate a specific
+    // memory OR a specific life event, not both at once — the product
+    // concept doesn't define what "both" would mean. Enforced here at the
+    // application layer rather than a DB CHECK constraint (see the plan
+    // doc for why: SQLite can't add one to an existing table without a
+    // risky full-table rebuild).
+    if (req.body.memoryId && req.body.lifeEventId) {
+      throw new BadRequestError('A photo can be attached to a memory or a life event, not both');
     }
 
     // If linking to a memory/life-event, verify ownership to prevent
@@ -130,6 +159,38 @@ router.delete(
     db.prepare('DELETE FROM photos WHERE id = ?').run(req.params.id);
     logAudit({ actorUserId: req.user.id, action: 'photo.deleted', targetType: 'photo', targetId: Number(req.params.id), ip: req.ip });
     res.status(204).end();
+  })
+);
+
+// V2.0-E (docs/V2_0_E_PLAN.md §3): lets an owner move a photo between "no
+// context," "attached to memory X," or "attached to life event Y" without
+// having to delete and re-upload identical bytes just to change metadata.
+router.put(
+  '/:id/attachment',
+  requireOwnership((req) => db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id), 'photo'),
+  [
+    body('memoryId').optional({ nullable: true }).isInt(),
+    body('lifeEventId').optional({ nullable: true }).isInt(),
+  ],
+  handleValidation,
+  asyncHandler(async (req, res) => {
+    const { memoryId, lifeEventId } = req.body;
+    if (memoryId && lifeEventId) {
+      throw new BadRequestError('A photo can be attached to a memory or a life event, not both');
+    }
+    if (memoryId) {
+      const m = db.prepare('SELECT owner_id FROM memories WHERE id = ?').get(memoryId);
+      if (!m || m.owner_id !== req.user.id) throw new BadRequestError('Invalid memoryId');
+    }
+    if (lifeEventId) {
+      const e = db.prepare('SELECT owner_id FROM life_events WHERE id = ?').get(lifeEventId);
+      if (!e || e.owner_id !== req.user.id) throw new BadRequestError('Invalid lifeEventId');
+    }
+
+    db.prepare('UPDATE photos SET memory_id = ?, life_event_id = ? WHERE id = ?')
+      .run(memoryId || null, lifeEventId || null, req.params.id);
+    logAudit({ actorUserId: req.user.id, action: 'photo.reattached', targetType: 'photo', targetId: Number(req.params.id), ip: req.ip });
+    res.json({ photo: toDTO(db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id)) });
   })
 );
 
