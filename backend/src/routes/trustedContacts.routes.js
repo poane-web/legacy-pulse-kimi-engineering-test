@@ -12,6 +12,7 @@ const { logAudit } = require('../utils/audit');
 const { sha256Hex, randomToken } = require('../utils/crypto');
 const { NotFoundError, ForbiddenError, ConflictError, BadRequestError } = require('../utils/errors');
 const config = require('../config/env');
+const { attemptReleaseTrustedContactMessages } = require('../services/legacyMessageRelease');
 
 const router = express.Router();
 
@@ -127,22 +128,13 @@ router.post(
     const count = db.prepare('SELECT COUNT(*) AS c FROM release_confirmations WHERE owner_id = ?').get(ownerId).c;
     const required = config.requiredReleaseConfirmations;
 
-    if (count >= required) {
-      // Release all pending trusted_contact_confirmation messages for this owner.
-      const pending = db.prepare(
-        "SELECT * FROM legacy_messages WHERE owner_id = ? AND release_type = 'trusted_contact_confirmation' AND status = 'pending'"
-      ).all(ownerId);
-      const release = db.prepare("UPDATE legacy_messages SET status = 'released', released_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?");
-      const notify = db.prepare('INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)');
-      for (const msg of pending) {
-        release.run(msg.id);
-        const beneficiary = db.prepare('SELECT * FROM beneficiaries WHERE id = ?').get(msg.beneficiary_id);
-        logAudit({ action: 'legacy_message.released', targetType: 'legacy_message', targetId: msg.id, metadata: { trigger: 'trusted_contact_confirmation' } });
-        if (beneficiary && beneficiary.linked_user_id) {
-          notify.run(beneficiary.linked_user_id, 'message_released', `A legacy message titled "${msg.title}" has been released to you.`);
-        }
-      }
-    }
+    // V2.0-D (docs/V2_0_D_PLAN.md, audit finding H2): release is now
+    // handled by the shared, transactional legacyMessageRelease module —
+    // each message's status update + notification + audit log happen
+    // atomically, and a failure releasing one message no longer risks
+    // leaving another half-released. See that module for the full
+    // atomicity/idempotency guarantees.
+    attemptReleaseTrustedContactMessages(ownerId);
 
     res.json({ message: 'Confirmation recorded', confirmationsReceived: count, confirmationsRequired: required });
   })

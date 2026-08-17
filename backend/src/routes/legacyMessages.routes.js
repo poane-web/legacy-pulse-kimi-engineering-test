@@ -11,6 +11,7 @@ const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { encryptField, decryptField } = require('../utils/crypto');
 const { ownerContext } = require('../utils/encryptionContext');
+const { attemptReleaseTrustedContactMessages } = require('../services/legacyMessageRelease');
 const { BadRequestError, ForbiddenError, NotFoundError } = require('../utils/errors');
 
 const router = express.Router();
@@ -82,6 +83,19 @@ router.post(
     if (isImmediate && beneficiary.linked_user_id) {
       db.prepare('INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)')
         .run(beneficiary.linked_user_id, 'message_released', `A legacy message titled "${title}" has been released to you.`);
+    }
+
+    // V2.0-D SECURITY FIX (docs/V2_0_D_PLAN.md, audit finding H3 -- High):
+    // V1 only checked/released trusted_contact_confirmation messages at
+    // the moment a new confirmation was submitted, scanning only messages
+    // that already existed at that moment. A message of this type created
+    // AFTER the owner's confirmation threshold was already met would sit
+    // in 'pending' forever -- a beneficiary wrongly denied access to
+    // content they were entitled to, with no way to notice or retrigger.
+    // This call is a safe no-op if the threshold isn't met (see
+    // services/legacyMessageRelease.js).
+    if (releaseType === 'trusted_contact_confirmation') {
+      attemptReleaseTrustedContactMessages(req.user.id);
     }
 
     res.status(201).json({ message: ownerDTO(db.prepare('SELECT * FROM legacy_messages WHERE id = ?').get(info.lastInsertRowid)) });

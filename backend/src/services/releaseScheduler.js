@@ -1,38 +1,21 @@
 // Background worker that releases scheduled-date legacy messages once
 // their release_at time has passed. Runs every minute via node-cron.
-// Extracted as a pure function (`runReleaseSweep`) so it's unit-testable
-// without waiting on a real cron tick.
+//
+// V2.0-D (docs/V2_0_D_PLAN.md): the actual release logic now lives in
+// services/legacyMessageRelease.js, the single shared module for the
+// pending->released transition. This file is just the cron wiring.
 'use strict';
 
 const cron = require('node-cron');
-const db = require('../db');
-const { logAudit } = require('../utils/audit');
+const { attemptReleaseScheduledMessages } = require('./legacyMessageRelease');
 
 function runReleaseSweep() {
-  const now = new Date().toISOString();
-  const due = db.prepare(
-    "SELECT * FROM legacy_messages WHERE status = 'pending' AND release_type = 'scheduled_date' AND release_at <= ?"
-  ).all(now);
-
-  const release = db.prepare("UPDATE legacy_messages SET status = 'released', released_at = ? WHERE id = ?");
-  const notify = db.prepare('INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)');
-
-  let released = 0;
-  for (const msg of due) {
-    release.run(now, msg.id);
-    logAudit({ action: 'legacy_message.released', targetType: 'legacy_message', targetId: msg.id, metadata: { trigger: 'scheduled_date' } });
-    const beneficiary = db.prepare('SELECT * FROM beneficiaries WHERE id = ?').get(msg.beneficiary_id);
-    if (beneficiary && beneficiary.linked_user_id) {
-      notify.run(beneficiary.linked_user_id, 'message_released', `A legacy message titled "${msg.title}" has been released to you.`);
-    }
-    released += 1;
-  }
-  return released;
+  return attemptReleaseScheduledMessages();
 }
 
 function startReleaseScheduler() {
-  // Every minute. Idempotent (a message already 'released' won't match the
-  // WHERE clause again), so overlapping runs are harmless.
+  // Every minute. Safe to overlap/retry: attemptReleaseScheduledMessages
+  // -> releaseMessage is idempotent per-message (see legacyMessageRelease.js).
   return cron.schedule('* * * * *', () => {
     try {
       runReleaseSweep();
