@@ -34,7 +34,6 @@ async function createTrustedContact(ownerToken, contactEmail, name) {
     .set('Authorization', `Bearer ${ownerToken}`)
     .send({ fullName: name, email: contactEmail });
   expect(created.status).toBe(201);
-
   const rawToken = new URL(`http://localhost${created.body.inviteLink}`).searchParams.get('token');
   return { id: created.body.trustedContact.id, rawToken };
 }
@@ -54,7 +53,6 @@ async function createBeneficiary(ownerToken, beneficiaryEmail) {
     .set('Authorization', `Bearer ${ownerToken}`)
     .send({ fullName: 'Test Beneficiary', email: beneficiaryEmail, relationship: 'Child' });
   expect(created.status).toBe(201);
-
   const rawToken = new URL(`http://localhost${created.body.inviteLink}`).searchParams.get('token');
   const claimed = await request(app)
     .post('/api/beneficiaries/claim')
@@ -68,13 +66,7 @@ async function createScheduledMessage(ownerToken, beneficiaryId, releaseAt = new
   const created = await request(app)
     .post('/api/legacy-messages')
     .set('Authorization', `Bearer ${ownerToken}`)
-    .send({
-      beneficiaryId,
-      title: 'Temporal attack target',
-      body: 'Sensitive milestone payload',
-      releaseType: 'scheduled_date',
-      releaseAt,
-    });
+    .send({ beneficiaryId, title: 'Temporal attack target', body: 'Sensitive milestone payload', releaseType: 'scheduled_date', releaseAt });
   expect(created.status).toBe(201);
   return created.body.message.id;
 }
@@ -83,12 +75,7 @@ async function createConfirmationMessage(ownerToken, beneficiaryId, requiredConf
   const created = await request(app)
     .post('/api/legacy-messages')
     .set('Authorization', `Bearer ${ownerToken}`)
-    .send({
-      beneficiaryId,
-      title: 'Confirmation target',
-      body: 'Sensitive confirmation payload',
-      releaseType: 'trusted_contact_confirmation',
-    });
+    .send({ beneficiaryId, title: 'Confirmation target', body: 'Sensitive confirmation payload', releaseType: 'trusted_contact_confirmation' });
   expect(created.status).toBe(201);
   if (requiredConfirmations !== 2) {
     db.prepare('UPDATE legacy_messages SET required_confirmations = ? WHERE id = ?').run(requiredConfirmations, created.body.message.id);
@@ -102,23 +89,32 @@ describe('V2 temporal adversarial audit', () => {
     const ownerToken = await registerAndLogin(ownerEmail);
     const beneficiary = await createBeneficiary(ownerToken, uniqueEmail('beneficiary'));
 
-    const contactA = await createTrustedContact(ownerToken, ownerEmail, 'Owner Contact A');
-    const contactB = await createTrustedContact(ownerToken, ownerEmail, 'Owner Contact B');
-    expect(contactA.id).not.toBe(contactB.id);
+    const createA = await request(app)
+      .post('/api/trusted-contacts')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ fullName: 'Owner Contact A', email: ownerEmail });
+    const createB = await request(app)
+      .post('/api/trusted-contacts')
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .send({ fullName: 'Owner Contact B', email: ownerEmail });
+    expect(createA.status).toBe(403);
+    expect(createB.status).toBe(403);
+
+    // Defense in depth: simulate legacy rows that predate the self-contact
+    // creation guard. The confirmation endpoint must reject the owner's
+    // identity even when such rows already exist in storage.
+    const owner = db.prepare('SELECT id FROM users WHERE email = ?').get(ownerEmail);
+    const contactA = db.prepare("INSERT INTO trusted_contacts (owner_id, full_name, email, status, linked_user_id) VALUES (?, ?, ?, 'active', ?)").run(owner.id, 'Legacy Owner Contact A', ownerEmail, owner.id);
+    const contactB = db.prepare("INSERT INTO trusted_contacts (owner_id, full_name, email, status, linked_user_id) VALUES (?, ?, ?, 'active', ?)").run(owner.id, 'Legacy Owner Contact B', ownerEmail, owner.id);
+    expect(contactA.lastInsertRowid).not.toBe(contactB.lastInsertRowid);
 
     const messageId = await createConfirmationMessage(ownerToken, beneficiary.id);
+    const first = await request(app).post(`/api/trusted-contacts/confirm/${messageId}`).set('Authorization', `Bearer ${ownerToken}`);
+    const second = await request(app).post(`/api/trusted-contacts/confirm/${messageId}`).set('Authorization', `Bearer ${ownerToken}`);
 
-    const first = await request(app)
-      .post(`/api/trusted-contacts/confirm/${messageId}`)
-      .set('Authorization', `Bearer ${ownerToken}`);
-    const second = await request(app)
-      .post(`/api/trusted-contacts/confirm/${messageId}`)
-      .set('Authorization', `Bearer ${ownerToken}`);
-
-    // The API resolves the owner to one active contact identity, so the second
-    // request must not manufacture a second authorization.
-    expect(first.status).toBe(200);
-    expect(second.status).toBe(409);
+    expect(first.status).toBe(403);
+    expect(second.status).toBe(403);
+    expect(db.prepare('SELECT COUNT(*) AS c FROM release_confirmations WHERE legacy_message_id = ?').get(messageId).c).toBe(0);
     expect(db.prepare('SELECT status FROM legacy_messages WHERE id = ?').get(messageId).status).toBe('pending');
   });
 
@@ -135,28 +131,19 @@ describe('V2 temporal adversarial audit', () => {
     await claimTrustedContact(contactBToken, contactB.rawToken);
 
     const messageId = await createConfirmationMessage(ownerToken, beneficiary.id);
-    const first = await request(app)
-      .post(`/api/trusted-contacts/confirm/${messageId}`)
-      .set('Authorization', `Bearer ${contactAToken}`);
+    const first = await request(app).post(`/api/trusted-contacts/confirm/${messageId}`).set('Authorization', `Bearer ${contactAToken}`);
     expect(first.status).toBe(200);
 
-    const revoked = await request(app)
-      .delete(`/api/trusted-contacts/${contactA.id}`)
-      .set('Authorization', `Bearer ${ownerToken}`);
+    const revoked = await request(app).delete(`/api/trusted-contacts/${contactA.id}`).set('Authorization', `Bearer ${ownerToken}`);
     expect(revoked.status).toBe(204);
 
-    const second = await request(app)
-      .post(`/api/trusted-contacts/confirm/${messageId}`)
-      .set('Authorization', `Bearer ${contactBToken}`);
+    const second = await request(app).post(`/api/trusted-contacts/confirm/${messageId}`).set('Authorization', `Bearer ${contactBToken}`);
     expect(second.status).toBe(200);
     expect(second.body.released).toBe(false);
     expect(db.prepare('SELECT COUNT(*) AS c FROM release_confirmations WHERE legacy_message_id = ?').get(messageId).c).toBe(1);
     expect(db.prepare('SELECT status FROM legacy_messages WHERE id = ?').get(messageId).status).toBe('pending');
 
-    // The revoked account must not be able to submit another confirmation.
-    const replay = await request(app)
-      .post(`/api/trusted-contacts/confirm/${messageId}`)
-      .set('Authorization', `Bearer ${contactAToken}`);
+    const replay = await request(app).post(`/api/trusted-contacts/confirm/${messageId}`).set('Authorization', `Bearer ${contactAToken}`);
     expect(replay.status).toBe(403);
   });
 
@@ -165,10 +152,7 @@ describe('V2 temporal adversarial audit', () => {
     const token = await registerAndLogin(email);
     const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
     db.prepare("UPDATE users SET status = 'disabled' WHERE id = ?").run(user.id);
-
-    const response = await request(app)
-      .get('/api/auth/me')
-      .set('Authorization', `Bearer ${token}`);
+    const response = await request(app).get('/api/auth/me').set('Authorization', `Bearer ${token}`);
     expect(response.status).toBe(401);
   });
 
@@ -177,10 +161,7 @@ describe('V2 temporal adversarial audit', () => {
     const token = await registerAndLogin(email);
     const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
     db.prepare("UPDATE users SET password_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 second') WHERE id = ?").run(user.id);
-
-    const response = await request(app)
-      .get('/api/auth/me')
-      .set('Authorization', `Bearer ${token}`);
+    const response = await request(app).get('/api/auth/me').set('Authorization', `Bearer ${token}`);
     expect(response.status).toBe(401);
   });
 
@@ -188,10 +169,7 @@ describe('V2 temporal adversarial audit', () => {
     const ownerToken = await registerAndLogin(uniqueEmail('beneficiary-delete'));
     const beneficiary = await createBeneficiary(ownerToken, uniqueEmail('beneficiary'));
     const messageId = await createScheduledMessage(ownerToken, beneficiary.id);
-
-    const deleted = await request(app)
-      .delete(`/api/beneficiaries/${beneficiary.id}`)
-      .set('Authorization', `Bearer ${ownerToken}`);
+    const deleted = await request(app).delete(`/api/beneficiaries/${beneficiary.id}`).set('Authorization', `Bearer ${ownerToken}`);
     expect(deleted.status).toBe(409);
     expect(db.prepare('SELECT id FROM legacy_messages WHERE id = ?').get(messageId)).toBeTruthy();
   });
@@ -201,14 +179,9 @@ describe('V2 temporal adversarial audit', () => {
     const beneficiary = await createBeneficiary(ownerToken, uniqueEmail('beneficiary'));
     const releaseAt = new Date(Date.now() - 5_000).toISOString();
     const messageId = await createScheduledMessage(ownerToken, beneficiary.id, releaseAt);
-
     const released = runReleaseSweep();
     expect(released).toBe(1);
-
-    const edited = await request(app)
-      .put(`/api/legacy-messages/${messageId}`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .send({ title: 'ATTACKED AFTER RELEASE' });
+    const edited = await request(app).put(`/api/legacy-messages/${messageId}`).set('Authorization', `Bearer ${ownerToken}`).send({ title: 'ATTACKED AFTER RELEASE' });
     expect(edited.status).toBe(400);
     expect(db.prepare('SELECT status, title FROM legacy_messages WHERE id = ?').get(messageId)).toEqual(expect.objectContaining({ status: 'released', title: 'Temporal attack target' }));
   });
@@ -217,10 +190,8 @@ describe('V2 temporal adversarial audit', () => {
     const ownerToken = await registerAndLogin(uniqueEmail('scheduler-restart'));
     const beneficiary = await createBeneficiary(ownerToken, uniqueEmail('beneficiary'));
     const messageId = await createScheduledMessage(ownerToken, beneficiary.id, new Date(Date.now() - 5_000).toISOString());
-
     expect(runReleaseSweep()).toBe(1);
     expect(runReleaseSweep()).toBe(0);
-
     const row = db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE type = 'message_released' AND user_id = (SELECT linked_user_id FROM beneficiaries WHERE id = (SELECT beneficiary_id FROM legacy_messages WHERE id = ?))").get(messageId);
     expect(row.c).toBe(1);
   });
@@ -229,18 +200,11 @@ describe('V2 temporal adversarial audit', () => {
     const ownerToken = await registerAndLogin(uniqueEmail('notification-gap'));
     const beneficiary = await createBeneficiary(ownerToken, uniqueEmail('beneficiary'));
     const messageId = await createScheduledMessage(ownerToken, beneficiary.id, new Date(Date.now() - 5_000).toISOString());
-
-    // Simulate a notification persistence/downstream failure immediately after
-    // the release UPDATE. There is no transaction spanning both effects.
     db.exec("CREATE TRIGGER fail_notification_insert BEFORE INSERT ON notifications BEGIN SELECT RAISE(ABORT, 'simulated notification outage'); END;");
     expect(() => runReleaseSweep()).toThrow();
     db.exec('DROP TRIGGER fail_notification_insert');
-
     expect(db.prepare('SELECT status FROM legacy_messages WHERE id = ?').get(messageId).status).toBe('released');
     expect(db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE user_id = (SELECT linked_user_id FROM beneficiaries WHERE id = (SELECT beneficiary_id FROM legacy_messages WHERE id = ?)) AND type = 'message_released'").get(messageId).c).toBe(0);
-
-    // A restart cannot repair the missing notification because the scheduler
-    // correctly refuses to re-release an already released message.
     expect(runReleaseSweep()).toBe(0);
   });
 
@@ -248,7 +212,6 @@ describe('V2 temporal adversarial audit', () => {
     const ownerToken = await registerAndLogin(uniqueEmail('scheduler-concurrency'));
     const beneficiary = await createBeneficiary(ownerToken, uniqueEmail('beneficiary'));
     const messageId = await createScheduledMessage(ownerToken, beneficiary.id, new Date(Date.now() - 5_000).toISOString());
-
     const results = await Promise.all(Array.from({ length: 10 }, () => Promise.resolve().then(() => runReleaseSweep())));
     expect(results.reduce((a, b) => a + b, 0)).toBe(1);
     expect(db.prepare('SELECT status FROM legacy_messages WHERE id = ?').get(messageId).status).toBe('released');
