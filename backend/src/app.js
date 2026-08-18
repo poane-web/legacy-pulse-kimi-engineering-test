@@ -10,6 +10,7 @@ const cookieParser = require('cookie-parser');
 const morgan = require('morgan');
 
 const config = require('./config/env');
+const db = require('./db');
 const { globalLimiter } = require('./middleware/rateLimit');
 const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
 
@@ -53,7 +54,19 @@ function createApp() {
   }
   app.use('/api', globalLimiter);
 
-  app.get('/api/health', (req, res) => res.json({ status: 'ok', env: config.nodeEnv }));
+  // V2.0-F (docs/V2_0_F_PRODUCTION_READINESS.md): a real liveness/readiness
+  // check for orchestrators/load balancers -- verifies the DB connection is
+  // actually usable, not just that the HTTP server is up. Returns 503 (not
+  // 200) if the DB check fails, so an orchestrator correctly stops routing
+  // traffic here instead of getting a false "healthy".
+  app.get('/api/health', (req, res) => {
+    try {
+      db.prepare('SELECT 1').get();
+      res.json({ status: 'ok', env: config.nodeEnv, db: 'connected' });
+    } catch (err) {
+      res.status(503).json({ status: 'error', env: config.nodeEnv, db: 'unavailable' });
+    }
+  });
 
   app.use('/api/auth', authRoutes.router);
   app.use('/api/users', usersRoutes);

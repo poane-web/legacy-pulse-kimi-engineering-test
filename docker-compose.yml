@@ -1,0 +1,36 @@
+# Reference docker-compose for local evaluation ONLY -- not a production
+# deployment manifest. See docs/V2_0_F_PRODUCTION_READINESS.md for what's
+# genuinely missing before this should run anywhere but a developer's
+# machine (this file deliberately does NOT bake secrets in -- see below).
+#
+# Usage:
+#   cp .env.example backend/.env   # then fill in real secret values
+#   docker compose up --build
+#
+# NOT verified by an actual `docker compose up` in the environment this
+# project was built in (no Docker available there) -- the Dockerfile and
+# this file were reasoned through carefully (path resolution, non-root
+# user, healthcheck) but have NOT been run end-to-end. Flagged explicitly
+# rather than claimed as tested, per the instruction not to claim
+# something works without having verified it.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "4000:4000"
+    env_file:
+      - backend/.env
+    volumes:
+      # Named volumes so uploaded files and the SQLite DB survive a
+      # container restart/rebuild. For a real deployment, the uploads
+      # volume should be external object storage (S3/GCS) instead -- see
+      # docs/V2_0_F_PRODUCTION_READINESS.md.
+      - legacy_pulse_data:/app/backend/data
+      - legacy_pulse_uploads:/app/backend/uploads
+    restart: unless-stopped
+
+volumes:
+  legacy_pulse_data:
+  legacy_pulse_uploads:
