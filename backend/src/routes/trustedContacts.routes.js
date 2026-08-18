@@ -25,12 +25,20 @@ router.get('/', requireAuth, asyncHandler(async (req, res) => {
 
 router.post('/', requireAuth, [body('fullName').trim().isLength({ min: 1, max: 200 }), body('email').isEmail().normalizeEmail()], handleValidation,
   asyncHandler(async (req, res) => {
+    // A trusted-contact quorum must consist of an independent identity. Allowing
+    // the owner to invite their own account lets the owner manufacture both
+    // sides of a death/confirmation policy and bypass the intended quorum.
+    const normalizedEmail = req.body.email.toLowerCase();
+    if (normalizedEmail === req.user.email.toLowerCase()) {
+      throw new ForbiddenError('The account owner cannot be their own trusted contact');
+    }
+
     const rawToken = randomToken(24);
     const tokenHash = sha256Hex(rawToken);
-    const info = db.prepare('INSERT INTO trusted_contacts (owner_id, full_name, email, invite_token_hash) VALUES (?, ?, ?, ?)').run(req.user.id, req.body.fullName, req.body.email, tokenHash);
+    const info = db.prepare('INSERT INTO trusted_contacts (owner_id, full_name, email, invite_token_hash) VALUES (?, ?, ?, ?)').run(req.user.id, req.body.fullName, normalizedEmail, tokenHash);
     logAudit({ actorUserId: req.user.id, action: 'trusted_contact.created', targetType: 'trusted_contact', targetId: info.lastInsertRowid, ip: req.ip });
     const row = db.prepare('SELECT * FROM trusted_contacts WHERE id = ?').get(info.lastInsertRowid);
-    res.status(201).json({ trustedContact: toDTO(row), inviteLink: `/claim-invite?type=trusted_contact&token=${rawToken}&email=${encodeURIComponent(req.body.email)}` });
+    res.status(201).json({ trustedContact: toDTO(row), inviteLink: `/claim-invite?type=trusted_contact&token=${rawToken}&email=${encodeURIComponent(normalizedEmail)}` });
   }));
 
 router.delete('/:id', requireAuth, requireOwnership((req) => db.prepare('SELECT * FROM trusted_contacts WHERE id = ?').get(req.params.id), 'trusted_contact'),
@@ -47,6 +55,11 @@ router.post('/claim', requireAuth, [body('token').isString().isLength({ min: 10 
     if (!row) throw new NotFoundError('Invite not found or already used');
     if (row.email.toLowerCase() !== req.user.email.toLowerCase()) {
       throw new BadRequestError('This invite was issued to a different email address');
+    }
+    // Defense in depth for legacy/pre-existing rows created before the
+    // self-contact invariant was enforced at creation time.
+    if (row.owner_id === req.user.id) {
+      throw new ForbiddenError('The account owner cannot claim their own trusted-contact invite');
     }
     db.prepare('UPDATE trusted_contacts SET linked_user_id = ?, status = ?, invite_token_hash = NULL WHERE id = ?')
       .run(req.user.id, 'active', row.id);
@@ -71,7 +84,7 @@ router.post('/confirm/:messageId', requireAuth, asyncHandler(async (req, res) =>
   const contact = db.prepare(
     'SELECT * FROM trusted_contacts WHERE owner_id = ? AND linked_user_id = ? AND status = ?'
   ).get(message.owner_id, req.user.id, 'active');
-  if (!contact) throw new ForbiddenError('You are not an active trusted contact for this account');
+  if (!contact || contact.linked_user_id === message.owner_id) throw new ForbiddenError('You are not an independent active trusted contact for this account');
 
   const confirmationTx = db.transaction(() => {
     try {
