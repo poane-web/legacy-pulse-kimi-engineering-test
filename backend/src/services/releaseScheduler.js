@@ -7,50 +7,58 @@ const { logAudit } = require('../utils/audit');
 function runReleaseSweep() {
   const now = new Date().toISOString();
   const due = db.prepare(
-    "SELECT id, beneficiary_id, title FROM legacy_messages WHERE status = 'pending' AND release_type = 'scheduled_date' AND release_at <= ?"
+    "SELECT id, config_version FROM legacy_messages WHERE status = 'pending' AND release_type = 'scheduled_date' AND release_at <= ?"
   ).all(now);
 
-  const releaseAndNotify = db.transaction((msg) => {
-    // The status predicate is part of the write, not merely the discovery
-    // query. Two scheduler workers can observe the same due row, but only
-    // one can transition it from pending -> released.
+  const releaseAndNotify = db.transaction((candidate) => {
+    // The candidate carries the configuration version observed by discovery.
+    // If the owner edits the release configuration before the claim, this
+    // conditional update loses the race and NOTHING is released. This prevents
+    // a scheduler from releasing a mixed old/new configuration.
     const result = db.prepare(
-      "UPDATE legacy_messages SET status = 'released', released_at = ? WHERE id = ? AND status = 'pending' AND release_type = 'scheduled_date' AND release_at <= ?"
-    ).run(now, msg.id, now);
+      "UPDATE legacy_messages SET status = 'released', released_at = ?, released_recipient_user_id = (SELECT linked_user_id FROM beneficiaries WHERE beneficiaries.id = legacy_messages.beneficiary_id) WHERE id = ? AND status = 'pending' AND release_type = 'scheduled_date' AND release_at <= ? AND config_version = ?"
+    ).run(now, candidate.id, now, candidate.config_version);
     if (result.changes !== 1) return false;
 
-    const beneficiary = db.prepare('SELECT linked_user_id FROM beneficiaries WHERE id = ?').get(msg.beneficiary_id);
-    if (beneficiary && beneficiary.linked_user_id) {
+    // Re-read AFTER the atomic claim. Notifications and audit metadata must be
+    // derived from exactly the configuration that won the release claim, never
+    // from a stale discovery snapshot.
+    const msg = db.prepare('SELECT id, title, beneficiary_id, released_recipient_user_id FROM legacy_messages WHERE id = ?').get(candidate.id);
+    if (!msg) throw new Error('Released message disappeared before notification');
+
+    if (msg.released_recipient_user_id) {
       db.prepare('INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)').run(
-        beneficiary.linked_user_id,
+        msg.released_recipient_user_id,
         'message_released',
         `A legacy message titled "${msg.title}" has been released to you.`
       );
     }
 
-    // The release audit event is part of the same transaction. The release
-    // is not durable unless the notification and audit event are durable too.
     logAudit({
       action: 'legacy_message.released',
       targetType: 'legacy_message',
       targetId: msg.id,
-      metadata: { trigger: 'scheduled_date' },
+      metadata: {
+        trigger: 'scheduled_date',
+        configVersion: candidate.config_version,
+        recipientUserId: msg.released_recipient_user_id || null,
+      },
     });
     return true;
   });
 
   let released = 0;
-  for (const msg of due) {
-    if (releaseAndNotify(msg)) released += 1;
+  for (const candidate of due) {
+    if (releaseAndNotify(candidate)) released += 1;
   }
   return released;
 }
 
 function startReleaseScheduler() {
-  // Every minute. The release, notification, and audit event commit as one
-  // transaction, so overlapping workers and transient notification failures
+  // Every minute. Release + recipient snapshot + notification + audit commit
+  // atomically, so overlapping workers and transient notification failures
   // cannot leave a message permanently marked released without its durable
-  // notification/audit record.
+  // side effects.
   return cron.schedule('* * * * *', () => {
     try {
       runReleaseSweep();
