@@ -70,8 +70,8 @@ router.post(
     const isImmediate = releaseType === 'immediate';
     const info = db.prepare(
       `INSERT INTO legacy_messages
-        (owner_id, beneficiary_id, title, body_encrypted, release_type, release_at, status, released_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        (owner_id, beneficiary_id, title, body_encrypted, release_type, release_at, status, released_at, released_recipient_user_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       req.user.id,
       beneficiaryId,
@@ -80,7 +80,8 @@ router.post(
       releaseType,
       normalizedReleaseAt,
       isImmediate ? 'released' : 'pending',
-      isImmediate ? new Date().toISOString() : null
+      isImmediate ? new Date().toISOString() : null,
+      isImmediate ? beneficiary.linked_user_id : null
     );
 
     logAudit({ actorUserId: req.user.id, action: 'legacy_message.created', targetType: 'legacy_message', targetId: info.lastInsertRowid, ip: req.ip });
@@ -114,21 +115,25 @@ router.put(
     const { title, body: msgBody, releaseAt } = req.body;
     const normalizedReleaseAt = releaseAt !== undefined ? normalizeReleaseAt(releaseAt) : undefined;
 
-    // Re-check status in the write. The ownership middleware's read can be
-    // stale: a scheduler or another session may release the message between
-    // the read and this UPDATE. A released message must never be editable.
+    // Re-check status AND configuration version in the write. The ownership
+    // middleware's read can be stale: a scheduler or another session may
+    // release or edit the message between the read and this UPDATE. Every
+    // mutable release field changes config_version, making the release claim
+    // and the edit mutually exclusive.
     const result = db.prepare(
       `UPDATE legacy_messages SET
         title = COALESCE(?, title),
         body_encrypted = COALESCE(?, body_encrypted),
-        release_at = COALESCE(?, release_at)
-       WHERE id = ? AND owner_id = ? AND status = 'pending'`
+        release_at = COALESCE(?, release_at),
+        config_version = config_version + 1
+       WHERE id = ? AND owner_id = ? AND status = 'pending' AND config_version = ?`
     ).run(
       title ?? null,
       msgBody !== undefined ? encryptField(msgBody) : null,
       normalizedReleaseAt ?? null,
       req.params.id,
-      req.user.id
+      req.user.id,
+      req.resource.config_version
     );
 
     if (result.changes !== 1) {
@@ -159,8 +164,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const rows = db.prepare(
       `SELECT lm.* FROM legacy_messages lm
-       JOIN beneficiaries b ON b.id = lm.beneficiary_id
-       WHERE b.linked_user_id = ? AND lm.status = 'released'
+       WHERE lm.released_recipient_user_id = ? AND lm.status = 'released'
        ORDER BY lm.released_at DESC`
     ).all(req.user.id);
     res.json({
@@ -175,8 +179,7 @@ router.get(
     const row = db.prepare('SELECT * FROM legacy_messages WHERE id = ?').get(req.params.id);
     if (!row) throw new NotFoundError('Message not found');
 
-    const beneficiary = db.prepare('SELECT * FROM beneficiaries WHERE id = ?').get(row.beneficiary_id);
-    const isAddressedToCaller = beneficiary && beneficiary.linked_user_id === req.user.id;
+    const isAddressedToCaller = row.released_recipient_user_id === req.user.id;
 
     if (!isAddressedToCaller || row.status !== 'released') {
       logAudit({
@@ -185,7 +188,7 @@ router.get(
         targetType: 'legacy_message',
         targetId: row.id,
         ip: req.ip,
-        metadata: { reason: !isAddressedToCaller ? 'not_addressed_to_caller' : 'not_yet_released' },
+        metadata: { reason: !isAddressedToCaller ? 'not_release_recipient' : 'not_yet_released' },
       });
       throw new ForbiddenError('This message is not available to you');
     }
