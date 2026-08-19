@@ -100,9 +100,6 @@ describe('V2 temporal adversarial audit', () => {
     expect(createA.status).toBe(403);
     expect(createB.status).toBe(403);
 
-    // Defense in depth: simulate legacy rows that predate the self-contact
-    // creation guard. The confirmation endpoint must reject the owner's
-    // identity even when such rows already exist in storage.
     const owner = db.prepare('SELECT id FROM users WHERE email = ?').get(ownerEmail);
     const contactA = db.prepare("INSERT INTO trusted_contacts (owner_id, full_name, email, status, linked_user_id) VALUES (?, ?, ?, 'active', ?)").run(owner.id, 'Legacy Owner Contact A', ownerEmail, owner.id);
     const contactB = db.prepare("INSERT INTO trusted_contacts (owner_id, full_name, email, status, linked_user_id) VALUES (?, ?, ?, 'active', ?)").run(owner.id, 'Legacy Owner Contact B', ownerEmail, owner.id);
@@ -196,16 +193,24 @@ describe('V2 temporal adversarial audit', () => {
     expect(row.c).toBe(1);
   });
 
-  test('ATTACK REVEAL: release can commit before notification delivery succeeds', async () => {
-    const ownerToken = await registerAndLogin(uniqueEmail('notification-gap'));
+  test('ATTACK BLOCKED: notification failure rolls back the release and audit event', async () => {
+    const ownerToken = await registerAndLogin(uniqueEmail('notification-atomicity'));
     const beneficiary = await createBeneficiary(ownerToken, uniqueEmail('beneficiary'));
     const messageId = await createScheduledMessage(ownerToken, beneficiary.id, new Date(Date.now() - 5_000).toISOString());
     db.exec("CREATE TRIGGER fail_notification_insert BEFORE INSERT ON notifications BEGIN SELECT RAISE(ABORT, 'simulated notification outage'); END;");
-    expect(() => runReleaseSweep()).toThrow();
+    expect(() => runReleaseSweep()).toThrow('simulated notification outage');
     db.exec('DROP TRIGGER fail_notification_insert');
-    expect(db.prepare('SELECT status FROM legacy_messages WHERE id = ?').get(messageId).status).toBe('released');
-    expect(db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE user_id = (SELECT linked_user_id FROM beneficiaries WHERE id = (SELECT beneficiary_id FROM legacy_messages WHERE id = ?)) AND type = 'message_released'").get(messageId).c).toBe(0);
-    expect(runReleaseSweep()).toBe(0);
+
+    expect(db.prepare('SELECT status, released_at FROM legacy_messages WHERE id = ?').get(messageId)).toEqual({ status: 'pending', released_at: null });
+    expect(db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE type = 'message_released' AND user_id = (SELECT linked_user_id FROM beneficiaries WHERE id = (SELECT beneficiary_id FROM legacy_messages WHERE id = ?))").get(messageId).c).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'legacy_message.released' AND target_id = ?").get(messageId).c).toBe(0);
+
+    // A scheduler restart/retry must be able to complete the release because
+    // the failed attempt left the message pending rather than half-released.
+    expect(runReleaseSweep()).toBe(1);
+    expect(db.prepare('SELECT status, released_at FROM legacy_messages WHERE id = ?').get(messageId).status).toBe('released');
+    expect(db.prepare("SELECT COUNT(*) AS c FROM notifications WHERE type = 'message_released' AND user_id = (SELECT linked_user_id FROM beneficiaries WHERE id = (SELECT beneficiary_id FROM legacy_messages WHERE id = ?))").get(messageId).c).toBe(1);
+    expect(db.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'legacy_message.released' AND target_id = ?").get(messageId).c).toBe(1);
   });
 
   test('ATTACK BLOCKED: concurrent scheduled sweeps perform exactly one state transition', async () => {
