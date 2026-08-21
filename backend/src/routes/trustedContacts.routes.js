@@ -25,9 +25,6 @@ router.get('/', requireAuth, asyncHandler(async (req, res) => {
 
 router.post('/', requireAuth, [body('fullName').trim().isLength({ min: 1, max: 200 }), body('email').isEmail().normalizeEmail()], handleValidation,
   asyncHandler(async (req, res) => {
-    // A trusted-contact quorum must consist of an independent identity. Allowing
-    // the owner to invite their own account lets the owner manufacture both
-    // sides of a death/confirmation policy and bypass the intended quorum.
     const normalizedEmail = req.body.email.toLowerCase();
     if (normalizedEmail === req.user.email.toLowerCase()) {
       throw new ForbiddenError('The account owner cannot be their own trusted contact');
@@ -56,8 +53,6 @@ router.post('/claim', requireAuth, [body('token').isString().isLength({ min: 10 
     if (row.email.toLowerCase() !== req.user.email.toLowerCase()) {
       throw new BadRequestError('This invite was issued to a different email address');
     }
-    // Defense in depth for legacy/pre-existing rows created before the
-    // self-contact invariant was enforced at creation time.
     if (row.owner_id === req.user.id) {
       throw new ForbiddenError('The account owner cannot claim their own trusted-contact invite');
     }
@@ -67,23 +62,17 @@ router.post('/claim', requireAuth, [body('token').isString().isLength({ min: 10 
     res.json({ message: 'You are now a trusted contact for this account.' });
   }));
 
-// A confirmation is a release authorization for ONE specific message. It is
-// deliberately not an owner-wide flag: otherwise two confirmations for one
-// message could retroactively release every other pending message belonging
-// to the same owner.
-//
-// V3 adds a second invariant: once the first valid confirmation is recorded,
-// the beneficiary's linked user identity is snapshotted. If that relationship
-// changes before quorum is reached, the release fails closed rather than
-// silently redirecting an already-authorized message to a different person.
+// A confirmation is a release authorization for ONE specific message.
+// V3 binds the release to the beneficiary identity present at the first valid
+// confirmation and refuses to redirect an in-progress quorum after identity
+// mutation. Release state, recipient snapshot, notification, and release audit
+// are committed in one transaction so a notification failure cannot leave a
+// message permanently marked released.
 router.post('/confirm/:messageId', requireAuth, asyncHandler(async (req, res) => {
   const messageId = Number(req.params.messageId);
   if (!Number.isSafeInteger(messageId) || messageId <= 0) throw new BadRequestError('Invalid messageId');
 
   const confirmationTx = db.transaction(() => {
-    // Re-read inside the transaction. The request-level read must never be the
-    // authority for a state transition because another session may have
-    // changed the message between the HTTP handler and this transaction.
     const message = db.prepare(
       "SELECT * FROM legacy_messages WHERE id = ? AND release_type = 'trusted_contact_confirmation'"
     ).get(messageId);
@@ -102,10 +91,6 @@ router.post('/confirm/:messageId', requireAuth, asyncHandler(async (req, res) =>
       throw new ConflictError('Release recipient is not currently linked to an account');
     }
 
-    // First authorization binds the release to the then-current recipient.
-    // Subsequent confirmations must use that same identity. This turns a
-    // mutable relationship into an immutable release fact once authorization
-    // has begun.
     if (message.release_recipient_snapshot_user_id == null) {
       const snap = db.prepare(
         "UPDATE legacy_messages SET release_recipient_snapshot_user_id = ? WHERE id = ? AND status = 'pending' AND release_recipient_snapshot_user_id IS NULL"
@@ -133,13 +118,33 @@ router.post('/confirm/:messageId', requireAuth, asyncHandler(async (req, res) =>
     let released = false;
 
     if (count >= required) {
-      // Finalization copies only the immutable recipient snapshot. The extra
-      // predicate makes the transition fail closed if the relationship was
-      // concurrently changed by a privileged/internal path.
       const result = db.prepare(
         "UPDATE legacy_messages SET status = 'released', released_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), released_recipient_user_id = release_recipient_snapshot_user_id WHERE id = ? AND status = 'pending' AND release_type = 'trusted_contact_confirmation' AND release_recipient_snapshot_user_id = (SELECT linked_user_id FROM beneficiaries WHERE beneficiaries.id = legacy_messages.beneficiary_id)"
       ).run(message.id);
       released = result.changes === 1;
+
+      if (released) {
+        const releasedMessage = db.prepare(
+          'SELECT id, title, released_recipient_user_id FROM legacy_messages WHERE id = ?'
+        ).get(message.id);
+        if (!releasedMessage.released_recipient_user_id) {
+          throw new ConflictError('Release recipient disappeared during finalization');
+        }
+
+        // Notification is a durable local side effect and therefore belongs
+        // inside the same transaction as the release. External email/SMS/etc.
+        // will later be emitted from a transactional outbox, not directly from
+        // this request.
+        db.prepare('INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)')
+          .run(releasedMessage.released_recipient_user_id, 'message_released', `A legacy message titled \"${releasedMessage.title}\" has been released to you.`);
+
+        logAudit({
+          action: 'legacy_message.released',
+          targetType: 'legacy_message',
+          targetId: message.id,
+          metadata: { trigger: 'trusted_contact_confirmation', recipientUserId: releasedMessage.released_recipient_user_id },
+        });
+      }
     }
 
     return { count, required, released, recipientUserId: message.release_recipient_snapshot_user_id };
@@ -154,15 +159,6 @@ router.post('/confirm/:messageId', requireAuth, asyncHandler(async (req, res) =>
     ip: req.ip,
     metadata: { confirmationsReceived: result.count, confirmationsRequired: result.required, recipientUserId: result.recipientUserId },
   });
-
-  if (result.released) {
-    const message = db.prepare('SELECT id, title, released_recipient_user_id FROM legacy_messages WHERE id = ?').get(messageId);
-    logAudit({ action: 'legacy_message.released', targetType: 'legacy_message', targetId: messageId, metadata: { trigger: 'trusted_contact_confirmation', recipientUserId: message.released_recipient_user_id } });
-    if (message.released_recipient_user_id) {
-      db.prepare('INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)')
-        .run(message.released_recipient_user_id, 'message_released', `A legacy message titled \"${message.title}\" has been released to you.`);
-    }
-  }
 
   res.json({ message: 'Confirmation recorded', confirmationsReceived: result.count, confirmationsRequired: result.required, released: result.released });
 }));
