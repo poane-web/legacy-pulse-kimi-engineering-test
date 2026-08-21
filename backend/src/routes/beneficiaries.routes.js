@@ -10,7 +10,7 @@ const { requireOwnership } = require('../middleware/rbac');
 const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { sha256Hex, randomToken } = require('../utils/crypto');
-const { NotFoundError, BadRequestError } = require('../utils/errors');
+const { NotFoundError, BadRequestError, ConflictError } = require('../utils/errors');
 
 const router = express.Router();
 
@@ -56,10 +56,6 @@ router.post(
     logAudit({ actorUserId: req.user.id, action: 'beneficiary.created', targetType: 'beneficiary', targetId: info.lastInsertRowid, ip: req.ip });
 
     const row = db.prepare('SELECT * FROM beneficiaries WHERE id = ?').get(info.lastInsertRowid);
-    // NOTE (documented simplification, see docs/THREAT_MODEL.md): no email
-    // delivery integration exists in this MVP. The raw invite token/link is
-    // returned here only to the Owner who just created the invite, standing
-    // in for "an email was sent". It must never be exposed to anyone else.
     res.status(201).json({
       beneficiary: toDTO(row),
       inviteLink: `/claim-invite?type=beneficiary&token=${rawInviteToken}&email=${encodeURIComponent(email)}`,
@@ -90,16 +86,22 @@ router.delete(
   requireAuth,
   requireOwnership((req) => db.prepare('SELECT * FROM beneficiaries WHERE id = ?').get(req.params.id), 'beneficiary'),
   asyncHandler(async (req, res) => {
-    db.prepare('DELETE FROM beneficiaries WHERE id = ?').run(req.params.id);
-    logAudit({ actorUserId: req.user.id, action: 'beneficiary.deleted', targetType: 'beneficiary', targetId: Number(req.params.id), ip: req.ip });
+    // legacy_messages currently reference beneficiaries with ON DELETE CASCADE.
+    // Deleting a beneficiary therefore used to silently destroy both pending
+    // and already-released legacy messages. A released legacy record is an
+    // irreversible historical commitment and must outlive relationship
+    // management changes. Refuse deletion while any message references it.
+    const dependent = db.prepare('SELECT COUNT(*) AS count FROM legacy_messages WHERE beneficiary_id = ?').get(req.params.id);
+    if (dependent.count > 0) {
+      throw new ConflictError('Beneficiary cannot be deleted while legacy messages reference it; revoke or replace the relationship instead');
+    }
+
+    db.prepare('DELETE FROM beneficiaries WHERE id = ? AND owner_id = ?').run(req.params.id, req.user.id);
+    logAudit({ actorUserId: req.user.id, action: 'beneficiary.revoked', targetType: 'beneficiary', targetId: Number(req.params.id), ip: req.ip });
     res.status(204).end();
   })
 );
 
-// A beneficiary claims their invite by registering/logging in separately
-// via /auth/register, then calling this to link their new user account to
-// the beneficiary record. Kept as a distinct explicit step (rather than
-// matching purely by email) so a beneficiary must possess the invite token.
 router.post(
   '/claim',
   requireAuth,

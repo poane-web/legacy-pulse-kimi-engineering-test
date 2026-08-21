@@ -11,7 +11,6 @@ const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { sha256Hex, randomToken } = require('../utils/crypto');
 const { NotFoundError, ForbiddenError, ConflictError, BadRequestError } = require('../utils/errors');
-const config = require('../config/env');
 
 const router = express.Router();
 
@@ -26,12 +25,20 @@ router.get('/', requireAuth, asyncHandler(async (req, res) => {
 
 router.post('/', requireAuth, [body('fullName').trim().isLength({ min: 1, max: 200 }), body('email').isEmail().normalizeEmail()], handleValidation,
   asyncHandler(async (req, res) => {
+    // A trusted-contact quorum must consist of an independent identity. Allowing
+    // the owner to invite their own account lets the owner manufacture both
+    // sides of a death/confirmation policy and bypass the intended quorum.
+    const normalizedEmail = req.body.email.toLowerCase();
+    if (normalizedEmail === req.user.email.toLowerCase()) {
+      throw new ForbiddenError('The account owner cannot be their own trusted contact');
+    }
+
     const rawToken = randomToken(24);
     const tokenHash = sha256Hex(rawToken);
-    const info = db.prepare('INSERT INTO trusted_contacts (owner_id, full_name, email, invite_token_hash) VALUES (?, ?, ?, ?)').run(req.user.id, req.body.fullName, req.body.email, tokenHash);
+    const info = db.prepare('INSERT INTO trusted_contacts (owner_id, full_name, email, invite_token_hash) VALUES (?, ?, ?, ?)').run(req.user.id, req.body.fullName, normalizedEmail, tokenHash);
     logAudit({ actorUserId: req.user.id, action: 'trusted_contact.created', targetType: 'trusted_contact', targetId: info.lastInsertRowid, ip: req.ip });
     const row = db.prepare('SELECT * FROM trusted_contacts WHERE id = ?').get(info.lastInsertRowid);
-    res.status(201).json({ trustedContact: toDTO(row), inviteLink: `/claim-invite?type=trusted_contact&token=${rawToken}&email=${encodeURIComponent(req.body.email)}` });
+    res.status(201).json({ trustedContact: toDTO(row), inviteLink: `/claim-invite?type=trusted_contact&token=${rawToken}&email=${encodeURIComponent(normalizedEmail)}` });
   }));
 
 router.delete('/:id', requireAuth, requireOwnership((req) => db.prepare('SELECT * FROM trusted_contacts WHERE id = ?').get(req.params.id), 'trusted_contact'),
@@ -46,53 +53,87 @@ router.post('/claim', requireAuth, [body('token').isString().isLength({ min: 10 
     const tokenHash = sha256Hex(req.body.token);
     const row = db.prepare('SELECT * FROM trusted_contacts WHERE invite_token_hash = ? AND status = ?').get(tokenHash, 'pending');
     if (!row) throw new NotFoundError('Invite not found or already used');
-    // Bind the invitation to the intended identity. Possession of a leaked
-    // token alone must not let an arbitrary account become a trusted contact.
     if (row.email.toLowerCase() !== req.user.email.toLowerCase()) {
       throw new BadRequestError('This invite was issued to a different email address');
     }
-    db.prepare('UPDATE trusted_contacts SET linked_user_id = ?, status = ?, invite_token_hash = NULL WHERE id = ?').run(req.user.id, 'active', row.id);
+    // Defense in depth for legacy/pre-existing rows created before the
+    // self-contact invariant was enforced at creation time.
+    if (row.owner_id === req.user.id) {
+      throw new ForbiddenError('The account owner cannot claim their own trusted-contact invite');
+    }
+    db.prepare('UPDATE trusted_contacts SET linked_user_id = ?, status = ?, invite_token_hash = NULL WHERE id = ?')
+      .run(req.user.id, 'active', row.id);
     logAudit({ actorUserId: req.user.id, action: 'trusted_contact.invite_claimed', targetType: 'trusted_contact', targetId: row.id, ip: req.ip });
     res.json({ message: 'You are now a trusted contact for this account.' });
   }));
 
-router.post('/confirm/:ownerId', requireAuth, asyncHandler(async (req, res) => {
-  const ownerId = Number(req.params.ownerId);
-  const contact = db.prepare('SELECT * FROM trusted_contacts WHERE owner_id = ? AND linked_user_id = ? AND status = ?').get(ownerId, req.user.id, 'active');
-  if (!contact) throw new ForbiddenError('You are not an active trusted contact for this account');
+// A confirmation is a release authorization for ONE specific message. It is
+// deliberately not an owner-wide flag: otherwise two confirmations for one
+// message could retroactively release every other pending message belonging
+// to the same owner.
+router.post('/confirm/:messageId', requireAuth, asyncHandler(async (req, res) => {
+  const messageId = Number(req.params.messageId);
+  if (!Number.isSafeInteger(messageId) || messageId <= 0) throw new BadRequestError('Invalid messageId');
 
-  const existing = db.prepare('SELECT 1 FROM release_confirmations WHERE owner_id = ? AND trusted_contact_id = ?').get(ownerId, contact.id);
-  if (existing) throw new ConflictError('You have already submitted a confirmation for this account');
+  const message = db.prepare(
+    "SELECT * FROM legacy_messages WHERE id = ? AND release_type = 'trusted_contact_confirmation'"
+  ).get(messageId);
+  if (!message) throw new NotFoundError('Confirmation target not found');
+  if (message.status !== 'pending') throw new ConflictError('This message is no longer pending release');
+
+  const contact = db.prepare(
+    'SELECT * FROM trusted_contacts WHERE owner_id = ? AND linked_user_id = ? AND status = ?'
+  ).get(message.owner_id, req.user.id, 'active');
+  if (!contact || contact.linked_user_id === message.owner_id) throw new ForbiddenError('You are not an independent active trusted contact for this account');
 
   const confirmationTx = db.transaction(() => {
-    db.prepare('INSERT INTO release_confirmations (owner_id, trusted_contact_id) VALUES (?, ?)').run(ownerId, contact.id);
-    const count = db.prepare('SELECT COUNT(*) AS c FROM release_confirmations WHERE owner_id = ?').get(ownerId).c;
-    const required = config.requiredReleaseConfirmations;
-    const released = [];
-    if (count >= required) {
-      const pending = db.prepare("SELECT * FROM legacy_messages WHERE owner_id = ? AND release_type = 'trusted_contact_confirmation' AND status = 'pending'").all(ownerId);
-      const release = db.prepare("UPDATE legacy_messages SET status = 'released', released_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND status = 'pending'");
-      for (const msg of pending) {
-        const result = release.run(msg.id);
-        if (result.changes === 1) released.push(msg);
+    try {
+      db.prepare(
+        'INSERT INTO release_confirmations (owner_id, legacy_message_id, trusted_contact_id) VALUES (?, ?, ?)'
+      ).run(message.owner_id, message.id, contact.id);
+    } catch (err) {
+      if (String(err.message).includes('UNIQUE constraint failed')) {
+        throw new ConflictError('You have already submitted a confirmation for this message');
       }
+      throw err;
     }
+
+    const count = db.prepare(
+      'SELECT COUNT(*) AS c FROM release_confirmations WHERE legacy_message_id = ?'
+    ).get(message.id).c;
+    const required = message.required_confirmations;
+    let released = false;
+
+    if (count >= required) {
+      const result = db.prepare(
+        "UPDATE legacy_messages SET status = 'released', released_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND status = 'pending' AND release_type = 'trusted_contact_confirmation'"
+      ).run(message.id);
+      released = result.changes === 1;
+    }
+
     return { count, required, released };
   });
 
   const result = confirmationTx();
-  logAudit({ actorUserId: req.user.id, action: 'trusted_contact.confirmation_submitted', targetType: 'user', targetId: ownerId, ip: req.ip, metadata: { confirmationsReceived: result.count, confirmationsRequired: result.required } });
+  logAudit({
+    actorUserId: req.user.id,
+    action: 'trusted_contact.confirmation_submitted',
+    targetType: 'legacy_message',
+    targetId: message.id,
+    ip: req.ip,
+    metadata: { confirmationsReceived: result.count, confirmationsRequired: result.required },
+  });
 
-  // Notifications are intentionally outside the state transaction: failure
-  // to notify must not roll back an already-valid release. A future outbox
-  // worker should make delivery durable.
-  const notify = db.prepare('INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)');
-  for (const msg of result.released) {
-    const beneficiary = db.prepare('SELECT * FROM beneficiaries WHERE id = ?').get(msg.beneficiary_id);
-    logAudit({ action: 'legacy_message.released', targetType: 'legacy_message', targetId: msg.id, metadata: { trigger: 'trusted_contact_confirmation' } });
-    if (beneficiary && beneficiary.linked_user_id) notify.run(beneficiary.linked_user_id, 'message_released', `A legacy message titled "${msg.title}" has been released to you.`);
+  if (result.released) {
+    const beneficiary = db.prepare('SELECT * FROM beneficiaries WHERE id = ?').get(message.beneficiary_id);
+    logAudit({ action: 'legacy_message.released', targetType: 'legacy_message', targetId: message.id, metadata: { trigger: 'trusted_contact_confirmation' } });
+    if (beneficiary && beneficiary.linked_user_id) {
+      db.prepare('INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)')
+        .run(beneficiary.linked_user_id, 'message_released', `A legacy message titled "${message.title}" has been released to you.`);
+    }
   }
-  res.json({ message: 'Confirmation recorded', confirmationsReceived: result.count, confirmationsRequired: result.required });
+
+  res.json({ message: 'Confirmation recorded', confirmationsReceived: result.count, confirmationsRequired: result.required, released: result.released });
 }));
 
 module.exports = router;
