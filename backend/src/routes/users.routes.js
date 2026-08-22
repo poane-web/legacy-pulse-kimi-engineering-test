@@ -10,6 +10,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { requireAuth } = require('../middleware/auth');
 const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
+const storage = require('../services/storage');
 const { BadRequestError, UnauthorizedError, NotFoundError } = require('../utils/errors');
 
 const router = express.Router();
@@ -116,6 +117,28 @@ router.delete(
     if (!matches) throw new UnauthorizedError('Password is incorrect');
 
     logAudit({ actorUserId: req.user.id, action: 'account.deleted', ip: req.ip });
+
+    // V3 SECURITY FIX (docs/security/V3-THREAT-MODEL.md, finding V3-M2):
+    // V1/V2 relied entirely on ON DELETE CASCADE to remove the DB rows for
+    // profile, beneficiaries, memories, documents, photos, life_events,
+    // legacy_messages, refresh_tokens, and notifications -- but the
+    // CASCADE only ever touched database rows. It never called
+    // storage.remove() for the encrypted files those `documents`/`photos`
+    // rows pointed at, so every uploaded file's ciphertext bytes were
+    // silently orphaned on disk forever after account deletion: no DB row
+    // references them, so they're unreachable via the API, but the bytes
+    // themselves were never actually deleted. For a feature whose entire
+    // purpose is deleting a user's data, this is a real gap (storage
+    // hygiene, and a "right to be forgotten" concern -- encrypted bytes
+    // are still personal data even if inaccessible through the app).
+    // Collect and remove the files BEFORE the cascading DB delete, so a
+    // failure here surfaces clearly rather than the files becoming
+    // permanently unreferenced first.
+    const documentsToRemove = db.prepare('SELECT stored_filename FROM documents WHERE owner_id = ?').all(req.user.id);
+    const photosToRemove = db.prepare('SELECT stored_filename FROM photos WHERE owner_id = ?').all(req.user.id);
+    for (const doc of documentsToRemove) storage.remove(doc.stored_filename);
+    for (const photo of photosToRemove) storage.remove(photo.stored_filename);
+
     // ON DELETE CASCADE removes profile, beneficiaries, memories, documents,
     // photos, life_events, legacy_messages, refresh_tokens, notifications.
     db.prepare('DELETE FROM users WHERE id = ?').run(req.user.id);

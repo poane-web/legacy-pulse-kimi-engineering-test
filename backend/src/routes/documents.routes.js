@@ -15,6 +15,7 @@ const { encryptField, decryptField } = require('../utils/crypto');
 const { ownerContext } = require('../utils/encryptionContext');
 const storage = require('../services/storage');
 const { contentMatchesDeclaredType } = require('../utils/fileSignature');
+const { sanitizeFilenameForHeader } = require('../utils/sanitizeFilename');
 const { BadRequestError } = require('../utils/errors');
 
 const router = express.Router();
@@ -109,7 +110,7 @@ router.get(
     const plaintext = storage.read(row.stored_filename, row.file_iv, row.file_auth_tag, row.checksum_sha256, row.enc_format, ownerContext('documents', 'file', row.owner_id));
     logAudit({ actorUserId: req.user.id, action: 'document.downloaded', targetType: 'document', targetId: row.id, ip: req.ip });
     res.setHeader('Content-Type', row.mime_type);
-    res.setHeader('Content-Disposition', `attachment; filename="${decryptField(row.original_filename_encrypted, ownerContext('documents', 'original_filename_encrypted', row.owner_id)).replace(/"/g, '')}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilenameForHeader(decryptField(row.original_filename_encrypted, ownerContext('documents', 'original_filename_encrypted', row.owner_id)))}"`);
     res.send(plaintext);
   })
 );

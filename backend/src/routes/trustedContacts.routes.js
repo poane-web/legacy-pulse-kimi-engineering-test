@@ -36,6 +36,37 @@ router.get(
   })
 );
 
+// V3 (docs/security/V3-THREAT-MODEL.md, finding V3-M3): V1/V2 gave the
+// owner NO way to see whether their account currently has any recorded
+// release-trigger confirmations -- confirmations never expire and are
+// only ever cleared by revoking the confirming trusted contact entirely.
+// A mistaken or malicious pair of confirmations left an owner's account
+// silently "primed": any future trusted_contact_confirmation message they
+// created would auto-release immediately (the V2.0-D H3 fix), with no way
+// for the owner to notice this state existed. This endpoint at least
+// makes that state visible and inspectable; it does not add expiry or a
+// one-click reset, which are flagged as deferred follow-ups in
+// docs/security/V3-PRODUCTION-READINESS.md.
+router.get(
+  '/confirmation-status',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const confirmations = db.prepare(
+      `SELECT rc.confirmed_at, tc.full_name, tc.email
+       FROM release_confirmations rc
+       JOIN trusted_contacts tc ON tc.id = rc.trusted_contact_id
+       WHERE rc.owner_id = ?
+       ORDER BY rc.confirmed_at ASC`
+    ).all(req.user.id);
+    res.json({
+      confirmationsReceived: confirmations.length,
+      confirmationsRequired: config.requiredReleaseConfirmations,
+      primed: confirmations.length >= config.requiredReleaseConfirmations,
+      confirmations: confirmations.map((c) => ({ confirmedAt: c.confirmed_at, trustedContactName: c.full_name, trustedContactEmail: c.email })),
+    });
+  })
+);
+
 router.post(
   '/',
   requireAuth,
@@ -98,8 +129,15 @@ router.post(
       });
       throw new BadRequestError('This invite was issued to a different email address');
     }
-    db.prepare('UPDATE trusted_contacts SET linked_user_id = ?, status = ?, invite_token_hash = NULL WHERE id = ?')
-      .run(req.user.id, 'active', row.id);
+    // V3 SECURITY FIX (docs/security/V3-THREAT-MODEL.md, finding V3-H1):
+    // same atomic-conditional-update fix as beneficiaries.routes.js — see
+    // that file's comment for the full rationale.
+    const updateResult = db.prepare(
+      "UPDATE trusted_contacts SET linked_user_id = ?, status = 'active', invite_token_hash = NULL WHERE id = ? AND status = 'pending'"
+    ).run(req.user.id, row.id);
+    if (updateResult.changes === 0) {
+      throw new ConflictError('This invite has already been claimed');
+    }
     logAudit({ actorUserId: req.user.id, action: 'trusted_contact.invite_claimed', targetType: 'trusted_contact', targetId: row.id, ip: req.ip });
     res.json({ message: 'You are now a trusted contact for this account.' });
   })
@@ -122,7 +160,31 @@ router.post(
     const existing = db.prepare('SELECT 1 FROM release_confirmations WHERE owner_id = ? AND trusted_contact_id = ?').get(ownerId, contact.id);
     if (existing) throw new ConflictError('You have already submitted a confirmation for this account');
 
-    db.prepare('INSERT INTO release_confirmations (owner_id, trusted_contact_id) VALUES (?, ?)').run(ownerId, contact.id);
+    // V3 SECURITY FIX (docs/security/V3-THREAT-MODEL.md, finding V3-M1):
+    // the check above and this INSERT are two separate statements. Under
+    // SQLite's single-process serialized execution, two requests from the
+    // same trusted contact can't actually interleave between them (no
+    // `await` boundary exists in this handler); under a real multi-worker
+    // Postgres deployment they genuinely could, and the second INSERT
+    // would then hit the UNIQUE(owner_id, trusted_contact_id) constraint
+    // as a raw, uncaught database error -- propagating as an unhandled
+    // 500 instead of the clean 409 the pre-check was meant to guarantee.
+    // The UNIQUE constraint itself was always the real data-integrity
+    // guarantee (a duplicate confirmation could never actually be
+    // persisted); this fix only makes the error response correct.
+    try {
+      db.prepare('INSERT INTO release_confirmations (owner_id, trusted_contact_id) VALUES (?, ?)').run(ownerId, contact.id);
+    } catch (err) {
+      // SQLite's constraint error code today; '23505' is Postgres's
+      // unique_violation code, included so this still works correctly if
+      // this app is ever ported to Postgres (see
+      // docs/security/V3-PRODUCTION-READINESS.md) without anyone having to
+      // remember to update this check.
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE' || err.code === 'SQLITE_CONSTRAINT' || err.code === '23505') {
+        throw new ConflictError('You have already submitted a confirmation for this account');
+      }
+      throw err;
+    }
     logAudit({ actorUserId: req.user.id, action: 'trusted_contact.confirmation_submitted', targetType: 'user', targetId: ownerId, ip: req.ip });
 
     const count = db.prepare('SELECT COUNT(*) AS c FROM release_confirmations WHERE owner_id = ?').get(ownerId).c;

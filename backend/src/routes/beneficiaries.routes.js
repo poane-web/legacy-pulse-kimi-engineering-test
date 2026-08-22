@@ -10,7 +10,7 @@ const { requireOwnership } = require('../middleware/rbac');
 const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { sha256Hex, randomToken } = require('../utils/crypto');
-const { NotFoundError, BadRequestError } = require('../utils/errors');
+const { NotFoundError, BadRequestError, ConflictError } = require('../utils/errors');
 
 const router = express.Router();
 
@@ -90,6 +90,32 @@ router.delete(
   requireAuth,
   requireOwnership((req) => db.prepare('SELECT * FROM beneficiaries WHERE id = ?').get(req.params.id), 'beneficiary'),
   asyncHandler(async (req, res) => {
+    // V3 SECURITY FIX (docs/security/V3-THREAT-MODEL.md, finding V3-H2):
+    // legacy_messages.beneficiary_id is ON DELETE CASCADE, meaning V1/V2
+    // let an owner delete a beneficiary and, with no warning at all,
+    // silently and permanently destroy every legacy message addressed to
+    // them -- INCLUDING already-released ones the beneficiary may have
+    // already read or been notified about. This directly conflicts with
+    // the product's core promise that released content reaches its
+    // recipient reliably. Retroactively destroying already-released
+    // content is arguably worse than merely losing access to it.
+    //
+    // Fixed at the application layer (not by changing the FK's ON DELETE
+    // behavior, which would need a full table rebuild in SQLite -- see
+    // the precedent in docs/V2_0_E_PLAN.md for why that's avoided where
+    // an equally-correct application-layer check exists): block deletion
+    // outright if the beneficiary has any released messages. The owner
+    // must not be able to make already-delivered content disappear.
+    const releasedCount = db.prepare(
+      "SELECT COUNT(*) AS c FROM legacy_messages WHERE beneficiary_id = ? AND status = 'released'"
+    ).get(req.params.id).c;
+    if (releasedCount > 0) {
+      throw new ConflictError(
+        `Cannot remove this beneficiary: they have ${releasedCount} already-released legacy message(s). ` +
+        'Released content cannot be retroactively destroyed. Delete the individual message(s) first if you understand the consequences, or contact support.'
+      );
+    }
+
     db.prepare('DELETE FROM beneficiaries WHERE id = ?').run(req.params.id);
     logAudit({ actorUserId: req.user.id, action: 'beneficiary.deleted', targetType: 'beneficiary', targetId: Number(req.params.id), ip: req.ip });
     res.status(204).end();
@@ -112,8 +138,24 @@ router.post(
     if (row.email.toLowerCase() !== req.user.email.toLowerCase()) {
       throw new BadRequestError('This invite was issued to a different email address');
     }
-    db.prepare('UPDATE beneficiaries SET linked_user_id = ?, invite_status = ?, invite_token_hash = NULL WHERE id = ?')
-      .run(req.user.id, 'claimed', row.id);
+    // V3 SECURITY FIX (docs/security/V3-THREAT-MODEL.md, finding
+    // V3-H1): the UPDATE below now re-checks invite_status='pending' in
+    // its WHERE clause and verifies exactly one row was affected, instead
+    // of relying solely on the earlier SELECT check. Under SQLite's
+    // single-process serialized execution the original check-then-act
+    // pattern was harmless; under a real multi-worker Postgres deployment,
+    // two concurrent requests racing on the same invite token could both
+    // pass the initial SELECT before either's UPDATE committed, producing
+    // a duplicate 'claimed' transition and a duplicate audit log entry for
+    // what should be a single event. This is now a single atomic
+    // conditional UPDATE, the same pattern already used in
+    // services/legacyMessageRelease.js.
+    const updateResult = db.prepare(
+      "UPDATE beneficiaries SET linked_user_id = ?, invite_status = 'claimed', invite_token_hash = NULL WHERE id = ? AND invite_status = 'pending'"
+    ).run(req.user.id, row.id);
+    if (updateResult.changes === 0) {
+      throw new ConflictError('This invite has already been claimed');
+    }
     logAudit({ actorUserId: req.user.id, action: 'beneficiary.invite_claimed', targetType: 'beneficiary', targetId: row.id, ip: req.ip });
     res.json({ message: 'Invite claimed. You can now view legacy messages addressed to you once released.' });
   })
