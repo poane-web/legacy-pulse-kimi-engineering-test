@@ -13,6 +13,7 @@ const { sha256Hex, randomToken } = require('../utils/crypto');
 const { NotFoundError, ForbiddenError, ConflictError, BadRequestError } = require('../utils/errors');
 const config = require('../config/env');
 const { attemptReleaseTrustedContactMessages } = require('../services/legacyMessageRelease');
+const { requireStepUpPassword } = require('../middleware/requireStepUpPassword');
 
 const router = express.Router();
 
@@ -94,6 +95,11 @@ router.delete(
   '/:id',
   requireAuth,
   requireOwnership((req) => db.prepare('SELECT * FROM trusted_contacts WHERE id = ?').get(req.params.id), 'trusted_contact'),
+  // V3 follow-up (docs/security/V3-THREAT-MODEL.md, category G step-up
+  // gap): revoking a trusted contact removes a check on release
+  // authority -- now requires password re-confirmation, matching the
+  // existing pattern for other high-consequence actions.
+  requireStepUpPassword(),
   asyncHandler(async (req, res) => {
     db.prepare('DELETE FROM trusted_contacts WHERE id = ?').run(req.params.id);
     logAudit({ actorUserId: req.user.id, action: 'trusted_contact.revoked', targetType: 'trusted_contact', targetId: Number(req.params.id), ip: req.ip });

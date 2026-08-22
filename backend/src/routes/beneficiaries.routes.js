@@ -11,6 +11,7 @@ const { handleValidation } = require('../middleware/validate');
 const { logAudit } = require('../utils/audit');
 const { sha256Hex, randomToken } = require('../utils/crypto');
 const { NotFoundError, BadRequestError, ConflictError } = require('../utils/errors');
+const { requireStepUpPassword } = require('../middleware/requireStepUpPassword');
 
 const router = express.Router();
 
@@ -89,6 +90,11 @@ router.delete(
   '/:id',
   requireAuth,
   requireOwnership((req) => db.prepare('SELECT * FROM beneficiaries WHERE id = ?').get(req.params.id), 'beneficiary'),
+  // V3 follow-up (docs/security/V3-THREAT-MODEL.md, category G step-up
+  // gap): deleting a beneficiary affects release authority (who can
+  // receive released content) -- now requires password re-confirmation,
+  // in addition to the V3-H2 guard against destroying released content.
+  requireStepUpPassword(),
   asyncHandler(async (req, res) => {
     // V3 SECURITY FIX (docs/security/V3-THREAT-MODEL.md, finding V3-H2):
     // legacy_messages.beneficiary_id is ON DELETE CASCADE, meaning V1/V2

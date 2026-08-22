@@ -204,7 +204,7 @@ describe('V3-H2: beneficiary deletion is blocked if it has released messages', (
       .send({ beneficiaryId, title: 'Already released', body: 'content', releaseType: 'immediate' });
     expect(msg.body.message.status).toBe('released');
 
-    const deleteAttempt = await request(app).delete(`/api/beneficiaries/${beneficiaryId}`).set('Authorization', `Bearer ${ownerToken}`);
+    const deleteAttempt = await request(app).delete(`/api/beneficiaries/${beneficiaryId}`).set('Authorization', `Bearer ${ownerToken}`).send({ password: 'SuperSecret99' });
     expect(deleteAttempt.status).toBe(409);
     expect(deleteAttempt.body.error.message).toMatch(/already-released/i);
 
@@ -220,7 +220,7 @@ describe('V3-H2: beneficiary deletion is blocked if it has released messages', (
       .send({ fullName: 'Deletable Beneficiary', email: 'v3h2-deletable@example.com' });
     const beneficiaryId = created.body.beneficiary.id;
 
-    const deleteRes = await request(app).delete(`/api/beneficiaries/${beneficiaryId}`).set('Authorization', `Bearer ${ownerToken}`);
+    const deleteRes = await request(app).delete(`/api/beneficiaries/${beneficiaryId}`).set('Authorization', `Bearer ${ownerToken}`).send({ password: 'SuperSecret99' });
     expect(deleteRes.status).toBe(204);
   });
 
@@ -234,8 +234,57 @@ describe('V3-H2: beneficiary deletion is blocked if it has released messages', (
     await request(app).post('/api/legacy-messages').set('Authorization', `Bearer ${ownerToken}`)
       .send({ beneficiaryId, title: 'Not yet released', body: 'content', releaseType: 'scheduled_date', releaseAt: future });
 
-    const deleteRes = await request(app).delete(`/api/beneficiaries/${beneficiaryId}`).set('Authorization', `Bearer ${ownerToken}`);
+    const deleteRes = await request(app).delete(`/api/beneficiaries/${beneficiaryId}`).set('Authorization', `Bearer ${ownerToken}`).send({ password: 'SuperSecret99' });
     expect(deleteRes.status).toBe(204); // pending messages cascade-delete, which is fine — nothing was ever delivered
+  });
+
+  test('step-up: deleting a beneficiary WITHOUT a password is rejected with 400', async () => {
+    const ownerToken = await registerAndLogin('v3h2-stepup-nopass@example.com');
+    const created = await request(app).post('/api/beneficiaries').set('Authorization', `Bearer ${ownerToken}`)
+      .send({ fullName: 'Step Up Target', email: 'v3h2-stepup-target@example.com' });
+    const res = await request(app).delete(`/api/beneficiaries/${created.body.beneficiary.id}`).set('Authorization', `Bearer ${ownerToken}`);
+    expect(res.status).toBe(400);
+  });
+
+  test('step-up: deleting a beneficiary with the WRONG password is rejected with 401', async () => {
+    const ownerToken = await registerAndLogin('v3h2-stepup-wrongpass@example.com');
+    const created = await request(app).post('/api/beneficiaries').set('Authorization', `Bearer ${ownerToken}`)
+      .send({ fullName: 'Step Up Target 2', email: 'v3h2-stepup-target2@example.com' });
+    const res = await request(app).delete(`/api/beneficiaries/${created.body.beneficiary.id}`).set('Authorization', `Bearer ${ownerToken}`).send({ password: 'totallyWrongPassword1' });
+    expect(res.status).toBe(401);
+
+    // The beneficiary must still exist — the wrong password blocked the deletion.
+    const stillThere = await request(app).get('/api/beneficiaries').set('Authorization', `Bearer ${ownerToken}`);
+    expect(stillThere.body.beneficiaries.some((b) => b.id === created.body.beneficiary.id)).toBe(true);
+  });
+});
+
+describe('V3 step-up: revoking a trusted contact requires password confirmation', () => {
+  test('WITHOUT a password is rejected with 400', async () => {
+    const ownerToken = await registerAndLogin('v3stepup-tc-owner@example.com');
+    const created = await request(app).post('/api/trusted-contacts').set('Authorization', `Bearer ${ownerToken}`)
+      .send({ fullName: 'TC Target', email: 'v3stepup-tc-target@example.com' });
+    const res = await request(app).delete(`/api/trusted-contacts/${created.body.trustedContact.id}`).set('Authorization', `Bearer ${ownerToken}`);
+    expect(res.status).toBe(400);
+  });
+
+  test('with the WRONG password is rejected with 401, and the contact is not revoked', async () => {
+    const ownerToken = await registerAndLogin('v3stepup-tc-owner2@example.com');
+    const created = await request(app).post('/api/trusted-contacts').set('Authorization', `Bearer ${ownerToken}`)
+      .send({ fullName: 'TC Target 2', email: 'v3stepup-tc-target2@example.com' });
+    const res = await request(app).delete(`/api/trusted-contacts/${created.body.trustedContact.id}`).set('Authorization', `Bearer ${ownerToken}`).send({ password: 'wrongPassword1' });
+    expect(res.status).toBe(401);
+
+    const list = await request(app).get('/api/trusted-contacts').set('Authorization', `Bearer ${ownerToken}`);
+    expect(list.body.trustedContacts.some((c) => c.id === created.body.trustedContact.id)).toBe(true);
+  });
+
+  test('with the CORRECT password succeeds (no regression)', async () => {
+    const ownerToken = await registerAndLogin('v3stepup-tc-owner3@example.com');
+    const created = await request(app).post('/api/trusted-contacts').set('Authorization', `Bearer ${ownerToken}`)
+      .send({ fullName: 'TC Target 3', email: 'v3stepup-tc-target3@example.com' });
+    const res = await request(app).delete(`/api/trusted-contacts/${created.body.trustedContact.id}`).set('Authorization', `Bearer ${ownerToken}`).send({ password: 'SuperSecret99' });
+    expect(res.status).toBe(204);
   });
 });
 

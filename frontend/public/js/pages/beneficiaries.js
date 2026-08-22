@@ -3,7 +3,7 @@
 import { el, clear, loadingState, emptyState } from '../dom.js';
 import { apiRequest } from '../api.js';
 import { pageHeader } from '../layout.js';
-import { openModal, confirmDialog } from '../components/modal.js';
+import { openModal, confirmDialog, promptPasswordConfirm } from '../components/modal.js';
 import { toast } from '../components/toast.js';
 
 export async function renderBeneficiaries(outlet) {
@@ -40,11 +40,13 @@ async function loadList(outlet) {
         el('div', { class: 'actions' }, [
           el('span', { class: `badge ${b.linked ? 'claimed' : 'pending'}`, text: b.linked ? 'Linked' : 'Invite pending' }),
           el('button', { class: 'btn small danger', text: 'Remove', onclick: () => {
-            confirmDialog({
+            // Removing a beneficiary requires password re-confirmation
+            // (step-up auth) — see backend middleware/requireStepUpPassword.js.
+            promptPasswordConfirm({
               title: `Remove ${b.fullName}?`,
-              message: 'They will no longer be able to receive legacy messages addressed to them.',
-              onConfirm: async () => {
-                await apiRequest(`/beneficiaries/${b.id}`, { method: 'DELETE' });
+              message: 'They will no longer be able to receive legacy messages addressed to them. This cannot be undone if they have no released messages; if they do, removal will be blocked.',
+              onConfirm: async (password) => {
+                await apiRequest(`/beneficiaries/${b.id}`, { method: 'DELETE', body: { password } });
                 toast('Beneficiary removed', 'success');
                 await loadList(outlet);
               },

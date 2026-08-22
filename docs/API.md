@@ -32,7 +32,7 @@ Standard error shape:
 | GET | /beneficiaries | bearer(owner) | List own beneficiaries |
 | POST | /beneficiaries | bearer(owner) | Create + generate invite token |
 | PUT | /beneficiaries/:id | bearer(owner), ownership | Update relationship/name |
-| DELETE | /beneficiaries/:id | bearer(owner), ownership | Revoke a beneficiary |
+| DELETE | /beneficiaries/:id | bearer(owner), ownership, step-up password | Revoke a beneficiary (blocked if they have released messages) |
 | POST | /beneficiaries/claim | none | Beneficiary claims invite via token during registration |
 
 ## Trusted Contacts
@@ -40,7 +40,7 @@ Standard error shape:
 |---|---|---|---|
 | GET | /trusted-contacts | bearer(owner) | List own trusted contacts |
 | POST | /trusted-contacts | bearer(owner) | Add trusted contact + invite token |
-| DELETE | /trusted-contacts/:id | bearer(owner), ownership | Revoke |
+| DELETE | /trusted-contacts/:id | bearer(owner), ownership, step-up password | Revoke |
 | POST | /trusted-contacts/confirm/:ownerId | bearer(linked contact) | Confirm release-trigger event for an owner |
 
 ## Memories / Stories / Instructions

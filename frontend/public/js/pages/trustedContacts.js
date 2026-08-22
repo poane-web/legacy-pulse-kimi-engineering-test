@@ -3,7 +3,7 @@
 import { el, clear, loadingState, emptyState } from '../dom.js';
 import { apiRequest } from '../api.js';
 import { pageHeader } from '../layout.js';
-import { openModal, confirmDialog } from '../components/modal.js';
+import { openModal, promptPasswordConfirm } from '../components/modal.js';
 import { toast } from '../components/toast.js';
 
 export async function renderTrustedContacts(outlet) {
@@ -40,11 +40,13 @@ async function loadList(outlet) {
         el('div', { class: 'actions' }, [
           el('span', { class: `badge ${c.status}`, text: c.status }),
           el('button', { class: 'btn small danger', text: 'Revoke', onclick: () => {
-            confirmDialog({
+            // Revoking a trusted contact requires password re-confirmation
+            // (step-up auth) — see backend middleware/requireStepUpPassword.js.
+            promptPasswordConfirm({
               title: `Revoke ${c.fullName}?`,
               message: 'They will no longer be able to confirm release-trigger events for your account.',
-              onConfirm: async () => {
-                await apiRequest(`/trusted-contacts/${c.id}`, { method: 'DELETE' });
+              onConfirm: async (password) => {
+                await apiRequest(`/trusted-contacts/${c.id}`, { method: 'DELETE', body: { password } });
                 toast('Trusted contact revoked', 'success');
                 await loadList(outlet);
               },

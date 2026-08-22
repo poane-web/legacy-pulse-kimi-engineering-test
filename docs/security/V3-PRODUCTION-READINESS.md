@@ -19,15 +19,20 @@ still the primary reference for those topics.
 
 ## Deferred, prioritized (next checkpoint)
 
-1. **Step-up authentication for release-authority-affecting actions.**
-   `DELETE /trusted-contacts/:id` and `DELETE /beneficiaries/:id` should
-   require password re-confirmation, matching the existing pattern
-   already used correctly for `PUT /users/password`,
-   `POST /security/mfa/disable`, and `DELETE /users/me`. Deferred this
-   pass specifically to keep the fix set bounded and independently
-   reviewable rather than changing every mutation endpoint's auth
-   requirements in one sweep — this is the single highest-priority
-   deferred item.
+Item 1 from this list (step-up authentication) has since been implemented
+in a follow-up commit — see `docs/security/V3-THREAT-MODEL.md`'s
+addendum below. Items 2–4 remain outstanding.
+
+1. ~~**Step-up authentication for release-authority-affecting actions.**~~
+   **DONE.** `DELETE /trusted-contacts/:id` and `DELETE
+   /beneficiaries/:id` now require password re-confirmation via a new
+   shared `middleware/requireStepUpPassword.js`, matching the existing
+   pattern already used for `PUT /users/password`,
+   `POST /security/mfa/disable`, and `DELETE /users/me`. Frontend updated
+   (new `promptPasswordConfirm` modal component) to match the new API
+   contract. 5 new regression tests; verified live against a running
+   server (missing password → 400, wrong password → 401 with the
+   resource left untouched, correct password → success).
 2. **Confirmation expiry.** `release_confirmations` never expire
    (V3-D2). A time-based expiry window (e.g. confirmations older than N
    days no longer count toward the release threshold) would close the

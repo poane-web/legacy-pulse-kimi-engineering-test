@@ -98,3 +98,50 @@ export function confirmDialog({ title, message, confirmLabel = 'Confirm', danger
   backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
   document.body.appendChild(backdrop);
 }
+
+// Step-up authentication prompt: used for high-consequence actions that
+// require re-confirming the account password (e.g. revoking a trusted
+// contact, removing a beneficiary) — see backend
+// middleware/requireStepUpPassword.js for the server-side counterpart.
+// onConfirm receives the entered password and should throw/reject with a
+// message on failure; the modal stays open and shows the error inline.
+export function promptPasswordConfirm({ title, message, confirmLabel = 'Confirm', danger = true, onConfirm }) {
+  const backdrop = el('div', { class: 'modal-backdrop' });
+  const passwordInput = el('input', { type: 'password', placeholder: 'Your password', autocomplete: 'current-password' });
+  const errBox = el('div', { class: 'error-text', style: 'display:none' });
+  const confirmBtn = el('button', {
+    class: `btn ${danger ? 'danger' : ''}`,
+    text: confirmLabel,
+    onclick: async () => {
+      errBox.style.display = 'none';
+      if (!passwordInput.value) {
+        errBox.textContent = 'Password is required.';
+        errBox.style.display = 'block';
+        return;
+      }
+      confirmBtn.disabled = true;
+      try {
+        await onConfirm(passwordInput.value);
+        backdrop.remove();
+      } catch (err) {
+        errBox.textContent = err.message || 'Something went wrong.';
+        errBox.style.display = 'block';
+      } finally {
+        confirmBtn.disabled = false;
+      }
+    },
+  });
+  const modal = el('div', { class: 'modal' }, [
+    el('h3', { text: title }),
+    el('p', { class: 'text-muted', text: message }),
+    el('div', { class: 'field' }, [el('label', { text: 'Confirm your password to continue' }), passwordInput]),
+    errBox,
+    el('div', { class: 'modal-actions' }, [
+      el('button', { class: 'btn secondary', text: 'Cancel', onclick: () => backdrop.remove() }),
+      confirmBtn,
+    ]),
+  ]);
+  backdrop.appendChild(modal);
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
+  document.body.appendChild(backdrop);
+}
