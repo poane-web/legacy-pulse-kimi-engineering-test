@@ -581,6 +581,64 @@ def create_memory(
     )
 
 
+@app.patch("/api/memories/{memory_id}", response_model=MemoryResponse)
+def update_memory(
+    memory_id: str,
+    body: MemoryUpdate,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.core.crypto import encrypt_user_text
+
+    mem = db.query(Memory).filter(
+        Memory.id == memory_id,
+        Memory.owner_id == user.id,
+    ).first()
+    if not mem:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if body.title is not None:
+        mem.title = body.title
+    if body.content is not None:
+        mem.content_encrypted = encrypt_user_text(body.content, user.id)
+        mem.content_iv = None
+        mem.encryption_version = 2
+    if body.memory_date is not None:
+        mem.memory_date = body.memory_date
+    if body.location is not None:
+        mem.location = body.location
+    if body.is_private is not None:
+        mem.is_private = body.is_private
+    if body.tags is not None:
+        mem.tags = json.dumps(body.tags)
+
+    db.commit()
+    db.refresh(mem)
+
+    ip, ua = get_client_info(request)
+    log_action(
+        db, "MEMORY_UPDATE", actor_id=user.id,
+        resource_type="Memory", resource_id=mem.id,
+        ip_address=ip, user_agent=ua,
+    )
+
+    try:
+        if getattr(mem, "encryption_version", 1) >= 2 and mem.content_encrypted.startswith("{"):
+            content = decrypt_user_text(mem.content_encrypted, mem.owner_id)
+        else:
+            content = decrypt_text(mem.content_encrypted, mem.content_iv or "")
+    except Exception:
+        content = "[decryption error]"
+
+    return MemoryResponse(
+        id=mem.id, title=mem.title, content=content,
+        memory_date=mem.memory_date, location=mem.location,
+        is_private=mem.is_private, tags=json.loads(mem.tags or "[]"),
+        created_at=mem.created_at, updated_at=mem.updated_at,
+    )
+
+
 @app.delete("/api/memories/{memory_id}", response_model=MessageResponse)
 def delete_memory(
     memory_id: str,
