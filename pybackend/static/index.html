@@ -237,52 +237,206 @@
     }
 
     async function renderMemories() {
-      const res = await api('/memories');
-      const list = res.ok ? await res.json() : [];
+      const [memRes, mediaRes] = await Promise.all([api('/memories'), api('/media')]);
+      const list = memRes.ok ? await memRes.json() : [];
+      const media = mediaRes.ok ? await mediaRes.json() : [];
+
       show(`
         <div class="space-y-6">
           <div class="flex items-center justify-between">
-            <h1 class="text-2xl font-bold">Memories</h1>
+            <div>
+              <h1 class="text-2xl font-bold">Memories</h1>
+              <p class="text-slate-500 text-sm mt-1">Preserve stories, moments, photos and documents that matter.</p>
+            </div>
             <button id="add-mem" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-medium">+ New Memory</button>
           </div>
+
           <div id="mem-form" class="hidden bg-white border rounded-xl p-6 space-y-4">
-            <input id="mem-title" placeholder="Title" class="w-full border rounded-lg px-3 py-2" />
-            <textarea id="mem-content" placeholder="Your memory..." rows="4" class="w-full border rounded-lg px-3 py-2"></textarea>
+            <div class="grid sm:grid-cols-2 gap-3">
+              <input id="mem-title" placeholder="Title" class="w-full border rounded-lg px-3 py-2" />
+              <input id="mem-date" type="date" class="w-full border rounded-lg px-3 py-2" />
+            </div>
+            <textarea id="mem-content" placeholder="Tell the story..." rows="6" class="w-full border rounded-lg px-3 py-2"></textarea>
             <input id="mem-location" placeholder="Location (optional)" class="w-full border rounded-lg px-3 py-2" />
-            <button id="save-mem" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm">Save</button>
+            <input id="mem-tags" placeholder="Tags, separated by commas (optional)" class="w-full border rounded-lg px-3 py-2" />
+            <div class="flex gap-2">
+              <button id="save-mem" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm">Save Memory</button>
+              <button id="cancel-mem" class="border px-4 py-2 rounded-lg text-sm">Cancel</button>
+            </div>
           </div>
+
           <div class="grid gap-4">
-            ${list.length === 0 ? '<p class="text-slate-500">No memories yet. Create your first one.</p>' : list.map(m => `
-              <div class="bg-white border rounded-xl p-5">
-                <div class="flex justify-between items-start">
-                  <h3 class="font-semibold text-lg">${escapeHtml(m.title)}</h3>
-                  <button data-del="${m.id}" class="text-red-500 text-sm hover:underline">Delete</button>
+            ${list.length === 0 ? '<p class="text-slate-500">No memories yet. Create your first one.</p>' : list.map(m => {
+              const attached = media.filter(a => a.memory_id === m.id);
+              return `
+                <div class="bg-white border rounded-xl p-5">
+                  <div class="flex justify-between items-start gap-4">
+                    <div>
+                      <h3 class="font-semibold text-lg">${escapeHtml(m.title)}</h3>
+                      <div class="mt-2 flex flex-wrap gap-2 text-xs text-slate-400">
+                        ${m.location ? `<span>📍 ${escapeHtml(m.location)}</span>` : ''}
+                        ${m.memory_date ? `<span>${new Date(m.memory_date).toLocaleDateString()}</span>` : ''}
+                        ${m.tags?.length ? `<span>🏷️ ${escapeHtml(m.tags.join(', '))}</span>` : ''}
+                        <span>📎 ${attached.length} attachment${attached.length === 1 ? '' : 's'}</span>
+                      </div>
+                    </div>
+                    <button data-del="${m.id}" class="text-red-500 text-sm hover:underline">Delete</button>
+                  </div>
+                  <p class="text-slate-600 mt-3 whitespace-pre-wrap line-clamp-4">${escapeHtml(m.content || '')}</p>
+                  <div class="mt-4 flex gap-2">
+                    <button data-open="${m.id}" class="bg-brand-50 text-brand-700 px-3 py-2 rounded-lg text-sm font-medium">Open memory</button>
+                    <button data-edit="${m.id}" class="border px-3 py-2 rounded-lg text-sm">Edit</button>
+                  </div>
                 </div>
-                <p class="text-slate-600 mt-2 whitespace-pre-wrap">${escapeHtml(m.content || '')}</p>
-                <div class="mt-3 flex gap-3 text-xs text-slate-400">
-                  ${m.location ? `<span>📍 ${m.location}</span>` : ''}
-                  ${m.memory_date ? `<span>${new Date(m.memory_date).toLocaleDateString()}</span>` : ''}
-                  <span>${(m.tags || []).join(', ')}</span>
-                </div>
-              </div>
-            `).join('')}
+              `;
+            }).join('')}
           </div>
         </div>
       `);
-      document.getElementById('add-mem').onclick = () => document.getElementById('mem-form').classList.toggle('hidden');
+
+      document.getElementById('add-mem').onclick = () => document.getElementById('mem-form').classList.remove('hidden');
+      document.getElementById('cancel-mem').onclick = () => document.getElementById('mem-form').classList.add('hidden');
+
       document.getElementById('save-mem').onclick = async () => {
-        const title = document.getElementById('mem-title').value;
-        const content = document.getElementById('mem-content').value;
-        const location = document.getElementById('mem-location').value;
+        const title = document.getElementById('mem-title').value.trim();
+        const content = document.getElementById('mem-content').value.trim();
+        const location = document.getElementById('mem-location').value.trim();
+        const memoryDate = document.getElementById('mem-date').value;
+        const tags = document.getElementById('mem-tags').value.split(',').map(x => x.trim()).filter(Boolean);
         if (!title || !content) return toast('Title and content required', 'error');
-        const res = await api('/memories', { method: 'POST', body: JSON.stringify({ title, content, location: location || null, tags: [] }) });
+
+        const payload = {
+          title, content, location: location || null,
+          memory_date: memoryDate ? new Date(memoryDate).toISOString() : null,
+          tags
+        };
+        const res = await api('/memories', { method: 'POST', body: JSON.stringify(payload) });
         if (res.ok) { toast('Memory saved'); renderMemories(); }
-        else toast('Failed', 'error');
+        else {
+          const err = await res.json().catch(() => ({}));
+          toast(err.detail?.message || err.detail || 'Failed to save memory', 'error');
+        }
       };
+
+      document.querySelectorAll('[data-open]').forEach(btn => btn.onclick = () => renderMemoryDetail(btn.dataset.open));
+      document.querySelectorAll('[data-edit]').forEach(btn => btn.onclick = () => renderMemoryDetail(btn.dataset.edit, true));
       document.querySelectorAll('[data-del]').forEach(btn => btn.onclick = async () => {
         if (!confirm('Delete this memory?')) return;
-        await api(`/memories/${btn.dataset.del}`, { method: 'DELETE' });
-        renderMemories();
+        const res = await api(`/memories/${btn.dataset.del}`, { method: 'DELETE' });
+        if (res.ok) { toast('Memory deleted'); renderMemories(); }
+        else toast('Delete failed', 'error');
+      });
+    }
+
+    async function renderMemoryDetail(memoryId, editMode = false) {
+      const [memRes, mediaRes] = await Promise.all([api('/memories'), api('/media')]);
+      if (!memRes.ok) return toast('Could not load memory', 'error');
+      const memories = await memRes.json();
+      const media = mediaRes.ok ? await mediaRes.json() : [];
+      const m = memories.find(item => item.id === memoryId);
+      if (!m) return toast('Memory not found', 'error');
+      const attached = media.filter(a => a.memory_id === memoryId);
+
+      show(`
+        <div class="space-y-6">
+          <div class="flex items-center justify-between">
+            <button id="back-memories" class="text-brand-600 text-sm font-medium">← Back to Memories</button>
+            <button id="toggle-memory-edit" class="border px-3 py-2 rounded-lg text-sm">${editMode ? 'Close editor' : 'Edit memory'}</button>
+          </div>
+
+          <div class="bg-white border rounded-xl p-6">
+            <div id="memory-view" class="${editMode ? 'hidden' : ''}">
+              <h1 class="text-2xl font-bold">${escapeHtml(m.title)}</h1>
+              <div class="mt-2 flex flex-wrap gap-2 text-xs text-slate-400">
+                ${m.location ? `<span>📍 ${escapeHtml(m.location)}</span>` : ''}
+                ${m.memory_date ? `<span>${new Date(m.memory_date).toLocaleDateString()}</span>` : ''}
+                ${m.tags?.length ? `<span>🏷️ ${escapeHtml(m.tags.join(', '))}</span>` : ''}
+              </div>
+              <div class="mt-6 whitespace-pre-wrap text-slate-700">${escapeHtml(m.content || '')}</div>
+            </div>
+
+            <div id="memory-editor" class="${editMode ? '' : 'hidden'} space-y-4">
+              <input id="edit-mem-title" value="${escapeHtml(m.title)}" class="w-full border rounded-lg px-3 py-2" />
+              <input id="edit-mem-date" type="date" value="${m.memory_date ? new Date(m.memory_date).toISOString().slice(0,10) : ''}" class="w-full border rounded-lg px-3 py-2" />
+              <textarea id="edit-mem-content" rows="8" class="w-full border rounded-lg px-3 py-2">${escapeHtml(m.content || '')}</textarea>
+              <input id="edit-mem-location" value="${escapeHtml(m.location || '')}" placeholder="Location (optional)" class="w-full border rounded-lg px-3 py-2" />
+              <input id="edit-mem-tags" value="${escapeHtml((m.tags || []).join(', '))}" placeholder="Tags, separated by commas" class="w-full border rounded-lg px-3 py-2" />
+              <button id="update-mem" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm">Save changes</button>
+            </div>
+          </div>
+
+          <div class="bg-white border rounded-xl p-6">
+            <div class="flex items-center justify-between mb-4">
+              <div>
+                <h2 class="font-semibold text-lg">Memory attachments</h2>
+                <p class="text-sm text-slate-500">Add photos or documents that belong to this memory.</p>
+              </div>
+            </div>
+            <form id="memory-media-form" class="flex flex-col sm:flex-row gap-3 items-end">
+              <div class="flex-1"><label class="text-sm font-medium">File</label><input type="file" id="memory-file" class="w-full text-sm" /></div>
+              <select id="memory-file-type" class="border rounded-lg px-3 py-2"><option value="PHOTO">Photo</option><option value="DOCUMENT">Document</option></select>
+              <button type="submit" class="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm">Upload attachment</button>
+            </form>
+            <div class="mt-5 space-y-2">
+              ${attached.length === 0 ? '<p class="text-sm text-slate-500">No attachments yet.</p>' : attached.map(a => `
+                <div class="flex items-center justify-between border rounded-lg px-3 py-2">
+                  <div>
+                    <div class="text-sm font-medium">${escapeHtml(a.original_name)}</div>
+                    <div class="text-xs text-slate-400">${a.type} · ${(a.size/1024).toFixed(1)} KB</div>
+                  </div>
+                  <button data-download-media="${a.id}" data-name="${escapeHtml(a.original_name)}" class="text-brand-600 text-sm font-medium">Download</button>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        </div>
+      `);
+
+      document.getElementById('back-memories').onclick = () => renderMemories();
+      document.getElementById('toggle-memory-edit').onclick = () => renderMemoryDetail(memoryId, !editMode);
+
+      document.getElementById('update-mem').onclick = async () => {
+        const title = document.getElementById('edit-mem-title').value.trim();
+        const content = document.getElementById('edit-mem-content').value.trim();
+        const location = document.getElementById('edit-mem-location').value.trim();
+        const memoryDate = document.getElementById('edit-mem-date').value;
+        const tags = document.getElementById('edit-mem-tags').value.split(',').map(x => x.trim()).filter(Boolean);
+        if (!title || !content) return toast('Title and content required', 'error');
+
+        const payload = {
+          title, content, location, tags,
+          memory_date: memoryDate ? new Date(memoryDate).toISOString() : null
+        };
+        const res = await api(`/memories/${memoryId}`, { method: 'PATCH', body: JSON.stringify(payload) });
+        if (res.ok) { toast('Memory updated'); renderMemoryDetail(memoryId, false); }
+        else {
+          const err = await res.json().catch(() => ({}));
+          toast(err.detail?.message || err.detail || 'Update failed', 'error');
+        }
+      };
+
+      document.getElementById('memory-media-form').onsubmit = async (e) => {
+        e.preventDefault();
+        const file = document.getElementById('memory-file').files[0];
+        if (!file) return toast('Select a file', 'error');
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('type', document.getElementById('memory-file-type').value);
+        fd.append('memory_id', memoryId);
+        const res = await fetch(`${API}/media`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}` },
+          body: fd
+        });
+        if (res.ok) { toast('Attachment uploaded & encrypted'); renderMemoryDetail(memoryId, false); }
+        else {
+          const err = await res.json().catch(() => ({}));
+          toast(err.detail?.message || err.detail || 'Upload failed', 'error');
+        }
+      };
+
+      document.querySelectorAll('[data-download-media]').forEach(btn => {
+        btn.onclick = () => downloadFile(btn.dataset.downloadMedia, btn.dataset.name);
       });
     }
 
